@@ -10,10 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
 )
+
+// debugLog is true if we should log debugging information about the connection
+var debugLog = true
 
 // Client represents a DDP client connection. The DDP client establish a DDP
 // session and acts as a message pump for other tools.
@@ -22,6 +26,8 @@ type Client struct {
 	HeartbeatInterval time.Duration
 	// HeartbeatTimeout is the time for a heartbeat ping to timeout
 	HeartbeatTimeout time.Duration
+	// ReconnectInterval is the time between reconnections on bad connections
+	ReconnectInterval time.Duration
 
 	// session contains the DDP session token (can be used for reconnects and debugging).
 	session string
@@ -29,14 +35,28 @@ type Client struct {
 	version string
 	// ws is the underlying websocket being used.
 	ws *websocket.Conn
+	// encoder is a JSON encoder to send outgoing packets to the websocket.
+	encoder *json.Encoder
+	// url the URL the websocket is connected to
+	url string
+	// origin is the origin for the websocket connection
+	origin string
 	// inbox is an incoming message channel
 	inbox chan map[string]interface{}
 	// errors is an incoming errors channel
 	errors chan error
+	// inboxDone is a channel to control the inbox worker
+	inboxDone chan bool
 	// pingTimer is a timer for sending regular pings to the server
 	pingTimer *time.Timer
 	// pings tracks inflight pings based on each ping ID.
 	pings map[string][]*pingTracker
+	// calls tracks method invocations that are still in flight
+	calls map[string]*Call
+	// nextID is the next ID for API calls
+	nextID uint64
+	// idMutex is a mutex to protect ID updates
+	idMutex *sync.Mutex
 }
 
 // NewClient creates a default client (using an internal websocket) to the
@@ -54,38 +74,32 @@ func NewClient(url, origin string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewClientWithWebsocket(ws)
-}
-
-// NewClientWithWebsocket creates a Client with an existing websocket.
-func NewClientWithWebsocket(ws *websocket.Conn) (*Client, error) {
-	client := defaultClient(ws)
+	c := defaultClient(ws, url, origin)
 	// We spin off an inbox stuffing goroutine
-	go inboxWorker(ws, client.inbox, client.errors, client.pingTimer, client.HeartbeatInterval)
+	go c.inboxWorker()
 
 	// Start DDP connection
-	// Is there any merit to making this a struct and using json.Marshal?
-	ws.Write([]byte("{\"msg\":\"connect\",\"version\":\"1\",\"support\":[\"1\"]}"))
+	c.Send(NewConnect())
 	// Read until we get a response - it will either be `connected` or `failed`
 	// The server may send a message without the `msg` key (which should be ignored).
 	for {
 		select {
-		case msg := <-client.inbox:
+		case msg := <-c.inbox:
 			// Message!
 			mtype, ok := msg["msg"]
 			if ok {
 				switch mtype.(string) {
 				case "connected":
-					client.version = "1" // Currently the only version we support
-					client.session = msg["session"].(string)
+					c.version = "1" // Currently the only version we support
+					c.session = msg["session"].(string)
 					// Start automatic heartbeats
-					client.pingTimer = time.AfterFunc(client.HeartbeatInterval, func() {
-						client.Ping()
-						client.pingTimer.Reset(client.HeartbeatInterval)
+					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
+						c.Ping()
+						c.pingTimer.Reset(c.HeartbeatInterval)
 					})
 					// Start manager
-					go inboxManager(client)
-					return client, nil
+					go c.inboxManager()
+					return c, nil
 				case "failed":
 					return nil, fmt.Errorf("Failed to connect, we support version 1 but server supports %s", msg["version"])
 				default:
@@ -93,8 +107,8 @@ func NewClientWithWebsocket(ws *websocket.Conn) (*Client, error) {
 					log.Println("Unexpected connection message", msg)
 				}
 			}
-		case err := <-client.errors:
-			client.ws.Close()
+		case err := <-c.errors:
+			c.ws.Close()
 			return nil, err
 		}
 	}
@@ -112,19 +126,147 @@ func (c *Client) Version() string {
 
 // Reconnect attempts to reconnect the client to the server on the existing
 // DDP session.
+//
+// TODO reconnect should also track and resend any subscriptions that are
+// active and any methods that may have been in flight as the resumed session
+// does not resume subscriptions and methods may or may not have been sent
+// and are supposed to be idempotent
 func (c *Client) Reconnect() {
-	// TODO implement reconnect
+	log.Println("Reconnecting...")
 	// Shutdown out all outstanding pings
-	// Shutdown inbox worker
+	c.pingTimer.Stop()
 	// Close websocket
+	c.ws.Close()
+	// Stop inbox manager
+	c.inboxDone <- true
 	// Reconnect
+	ws, err := websocket.Dial(c.url, "", c.origin)
+	if err != nil {
+		log.Println("Dial error", err)
+		// Reconnect again after set interval
+		time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+		return
+	}
+	log.Println("Dialed")
+
+	c.ws = ws
+	// We spin off an inbox stuffing goroutine
+	go c.inboxWorker()
+
+	// Start DDP connection
+	c.Send(NewReconnect(c.session))
+
+	log.Println("Attempted to resume session")
+
+	// Read until we get a response - it will either be `connected` or `failed`
+	// The server may send a message without the `msg` key (which should be ignored).
+	for {
+		select {
+		case msg := <-c.inbox:
+			// Message!
+			mtype, ok := msg["msg"]
+			if ok {
+				switch mtype.(string) {
+				case "connected":
+					c.version = "1" // Currently the only version we support
+					c.session = msg["session"].(string)
+					// Start automatic heartbeats
+					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
+						c.Ping()
+						c.pingTimer.Reset(c.HeartbeatInterval)
+					})
+					// Start manager
+					go c.inboxManager()
+					log.Println("Reconnected")
+					return
+				case "failed":
+					log.Printf("Failed to connect, we support version 1 but server supports %s", msg["version"])
+					// Reconnect again after set interval
+					time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+					return
+				default:
+					// Ignore?
+					log.Println("Unexpected connection message", msg)
+				}
+			}
+		case err := <-c.errors:
+			c.ws.Close()
+			log.Println("Reconnection error", err)
+			// Reconnect again after set interval
+			time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+			return
+		}
+	}
+}
+
+// Call represents an active RPC.
+type Call struct {
+	ID            string      // The uuid for this method call
+	ServiceMethod string      // The name of the service and method to call.
+	Args          interface{} // The argument to the function (*struct).
+	Reply         interface{} // The reply from the function (*struct).
+	Error         error       // After completion, the error status.
+	Done          chan *Call  // Strobes when call is complete.
+	Owner         *Client     // Client that owns the method call
+}
+
+func (call *Call) done() {
+	delete(call.Owner.calls, call.ID)
+	select {
+	case call.Done <- call:
+		// ok
+	default:
+		// We don't want to block here.  It is the caller's responsibility to make
+		// sure the channel has enough buffer space. See comment in Go().
+		if debugLog {
+			log.Println("rpc: discarding Call reply due to insufficient Done chan capacity")
+		}
+	}
+}
+
+// Go invokes the function asynchronously.  It returns the Call structure representing
+// the invocation.  The done channel will signal when the call is complete by returning
+// the same Call object.  If done is nil, Go will allocate a new channel.
+// If non-nil, done must be buffered or Go will deliberately crash.
+//
+// Go and Call are modeled after the standard `net/rpc` package versions.
+func (c *Client) Go(serviceMethod string, args []interface{}, reply interface{}, done chan *Call) *Call {
+
+	call := new(Call)
+	call.ID = c.newID()
+	call.ServiceMethod = serviceMethod
+	call.Args = args
+	call.Reply = reply
+	if done == nil {
+		done = make(chan *Call, 10) // buffered.
+	} else {
+		// If caller passes done != nil, it must arrange that
+		// done has enough buffer for the number of simultaneous
+		// RPCs that will be using that channel.  If the channel
+		// is totally unbuffered, it's best not to run at all.
+		if cap(done) == 0 {
+			log.Panic("ddp.rpc: done channel is unbuffered")
+		}
+	}
+	call.Done = done
+	c.calls[call.ID] = call
+
+	//c.ws.Write(call)
+
+	return call
+}
+
+// Call invokes the named function, waits for it to complete, and returns its error status.
+func (c *Client) Call(serviceMethod string, args []interface{}, reply interface{}) error {
+	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+	return call.Error
 }
 
 // Ping sends a heartbeat signal to the server. The Ping doesn't look for
 // a response but may trigger the connection to reconnect if the ping timesout.
 // This is primarily useful for reviving an unresponsive Client connection.
 func (c *Client) Ping() {
-	c.PingPong("", c.HeartbeatTimeout, func(err error) {
+	c.PingPong(c.newID(), c.HeartbeatTimeout, func(err error) {
 		if err != nil {
 			// Is there anything else we should or can do?
 			c.Reconnect()
@@ -137,13 +279,7 @@ func (c *Client) Ping() {
 // track the responses - or an empty string can be used. It is the
 // responsibility of the caller to respond to any errors that may occur.
 func (c *Client) PingPong(id string, timeout time.Duration, handler func(error)) {
-	var msg []byte
-	if len(id) == 0 {
-		msg = []byte("{\"msg\":\"ping\"}")
-	} else {
-		msg = []byte("{\"msg\":\"ping\",\"id\":\"" + id + "\"}")
-	}
-	_, err := c.ws.Write(msg)
+	_, err := c.Send(NewPing(id))
 	if err != nil {
 		handler(err)
 		return
@@ -158,6 +294,16 @@ func (c *Client) PingPong(id string, timeout time.Duration, handler func(error))
 	c.pings[id] = append(pings, tracker)
 }
 
+// Send transmits messages to the server.
+func (c *Client) Send(msg interface{}) (int, error) {
+	switch msg.(type) {
+	case []byte:
+		return c.ws.Write(msg.([]byte))
+	default:
+		return -1, c.encoder.Encode(msg)
+	}
+}
+
 // Close implements the io.Closer interface.
 func (c *Client) Close() {
 	c.ws.Close()
@@ -169,24 +315,40 @@ type pingTracker struct {
 	timer   *time.Timer
 }
 
+// newID issues a new ID for use in calls.
+func (c *Client) newID() string {
+	c.idMutex.Lock()
+	next := c.nextID
+	c.nextID++
+	c.idMutex.Unlock()
+	return fmt.Sprintf("%x", next)
+}
+
 // defaultClient creates a default Client.
-func defaultClient(ws *websocket.Conn) *Client {
-	return &Client{
+func defaultClient(ws *websocket.Conn, url, origin string) *Client {
+	c := &Client{
 		HeartbeatInterval: 30 * time.Second, // Meteor impl default - 5 (we ping first)
 		HeartbeatTimeout:  15 * time.Second, // Meteor impl default
+		ReconnectInterval: 5 * time.Second,
 		ws:                ws,
+		url:               url,
+		origin:            origin,
 		inbox:             make(chan map[string]interface{}, 100),
 		errors:            make(chan error, 100),
+		inboxDone:         make(chan bool, 0),
 		pings:             map[string][]*pingTracker{},
+		idMutex:           new(sync.Mutex),
 	}
+	c.encoder = json.NewEncoder(ws)
+	return c
 }
 
 // inboxManager pulls messages from the inbox and routes them to appropriate
 // handlers.
-func inboxManager(client *Client) {
+func (c *Client) inboxManager() {
 	for {
 		select {
-		case msg := <-client.inbox:
+		case msg := <-c.inbox:
 			// Message!
 			mtype, ok := msg["msg"]
 			if ok {
@@ -197,9 +359,9 @@ func inboxManager(client *Client) {
 					// We received a ping - need to respond with a pong
 					id, ok := msg["id"]
 					if ok {
-						client.ws.Write([]byte("{\"msg\":\"pong\",\"id\":" + id.(string) + "\"}"))
+						c.Send(NewPong(id.(string)))
 					} else {
-						client.ws.Write([]byte("{\"msg\":\"pong\"}"))
+						c.Send(NewPong(""))
 					}
 				case "pong":
 					// We received a pong - we can clear the ping tracker and call its handler
@@ -208,12 +370,12 @@ func inboxManager(client *Client) {
 					if ok {
 						key = id.(string)
 					}
-					pings, ok := client.pings[key]
+					pings, ok := c.pings[key]
 					if ok && len(pings) > 0 {
 						ping := pings[0]
 						pings = pings[1:]
 						if len(key) == 0 || len(pings) > 0 {
-							client.pings[key] = pings
+							c.pings[key] = pings
 						}
 						ping.timer.Stop()
 						ping.handler(nil)
@@ -221,68 +383,57 @@ func inboxManager(client *Client) {
 
 				// Live Data
 				case "nosub":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 				case "added":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 				case "changed":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 				case "removed":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 				case "ready":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 				case "addedBefore":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 				case "movedBefore":
-					log.Printf("Failed to connect, we support version 1 but server supports %s\n", msg["version"])
+					log.Println(mtype, msg)
 
 				// RPC
 				case "result":
+					log.Println(mtype, msg)
 				case "updated":
+					log.Println(mtype, msg)
+
 				default:
 					// Ignore?
 					log.Println("Unexpected message", msg)
 				}
 			}
-		case err := <-client.errors:
+		case err := <-c.errors:
 			log.Println("Error", err)
+		case _ = <-c.inboxDone:
+			log.Println("Inbox finished processing")
+			break
 		}
 	}
 }
 
 // inboxWorker pulls messages from a websocket, decodes JSON packets, and
 // stuffs them into a message channel.
-func inboxWorker(ws io.Reader, inbox chan<- map[string]interface{}, errors chan<- error, timer *time.Timer, interval time.Duration) {
-	// Read until we get a response - it will either be `connected` or `failed`
-	// The server may send a message without the `msg` key (which should be ignored).
-	buffer := make([]byte, 4096)
-	var read int
-	var err error
+func (c *Client) inboxWorker() {
+	dec := json.NewDecoder(c.ws)
 	for {
-		// TODO this needs to move to a streaming decoder - messages can be
-		// pretty big!
-		for read, err = ws.Read(buffer); read == len(buffer) || err != nil; read, err = ws.Read(buffer) {
-			// Buffer not big enough - we read until drained
-			if read == 0 {
-				// This can loop infinitely fast with read == 0 so we will
-				// sleep so we don't use up all the available CPU.
-				log.Println("ddp.start ######### ws timeout")
-				time.Sleep(1 * time.Second)
-			} else {
-				log.Println("ddp.start reading event", read)
-			}
-			if timer != nil {
-				timer.Reset(interval)
-			}
-		}
-		if timer != nil {
-			timer.Reset(interval)
-		}
 		var event interface{}
-		err = json.Unmarshal(buffer[0:read], &event)
-		if err != nil {
-			errors <- err
-		} else {
-			inbox <- event.(map[string]interface{})
+
+		if err := dec.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			c.errors <- err
 		}
+		if c.pingTimer != nil {
+			c.pingTimer.Reset(c.HeartbeatInterval)
+		}
+		c.inbox <- event.(map[string]interface{})
 	}
+	// Spawn a reconnect
+	c.Reconnect()
 }
