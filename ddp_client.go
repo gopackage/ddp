@@ -19,6 +19,8 @@ type Client struct {
 	HeartbeatTimeout time.Duration
 	// ReconnectInterval is the time between reconnections on bad connections
 	ReconnectInterval time.Duration
+	// Collections contains all the collections currently subscribed
+	Collections map[string]Collection
 
 	// session contains the DDP session token (can be used for reconnects and debugging).
 	session string
@@ -44,6 +46,8 @@ type Client struct {
 	pings map[string][]*pingTracker
 	// calls tracks method invocations that are still in flight
 	calls map[string]*Call
+	// subs tracks active subscriptions. Map contains name->args
+	subs map[string][]interface{}
 
 	// idManager tracks IDs for ddp messages
 	idManager
@@ -68,6 +72,7 @@ func NewClient(url, origin string) (*Client, error) {
 		HeartbeatInterval: 45 * time.Second, // Meteor impl default + 10 (we ping last)
 		HeartbeatTimeout:  15 * time.Second, // Meteor impl default
 		ReconnectInterval: 5 * time.Second,
+		Collections:       map[string]Collection{},
 		ws:                ws,
 		url:               url,
 		origin:            origin,
@@ -76,6 +81,7 @@ func NewClient(url, origin string) (*Client, error) {
 		inboxDone:         make(chan bool, 0),
 		pings:             map[string][]*pingTracker{},
 		calls:             map[string]*Call{},
+		subs:              map[string][]interface{}{},
 		idManager:         *newidManager(),
 	}
 	c.encoder = json.NewEncoder(ws)
@@ -132,6 +138,7 @@ func (c *Client) Version() string {
 // Reconnect attempts to reconnect the client to the server on the existing
 // DDP session.
 //
+// TODO needs a reconnect backoff so we don't trash a down server
 // TODO reconnect should also track and resend any subscriptions that are
 // active and any methods that may have been in flight as the resumed session
 // does not resume subscriptions and methods may or may not have been sent
@@ -219,6 +226,11 @@ func (c *Client) Subscribe(subName string, args []interface{}, done chan *Call) 
 	}
 	call.Done = done
 	c.calls[call.ID] = call
+
+	// Save this subscription to the client so we can reconnect
+	subArgs := make([]interface{}, len(args))
+	copy(subArgs, args)
+	c.subs[subName] = subArgs
 
 	c.Send(NewSub(call.ID, subName, args))
 
@@ -373,12 +385,6 @@ func (c *Client) inboxManager() {
 				case "nosub":
 					log.Println(mtype, msg)
 					// TODO callback an error
-				case "added":
-					log.Println(mtype, msg)
-				case "changed":
-					log.Println(mtype, msg)
-				case "removed":
-					log.Println(mtype, msg)
 				case "ready":
 					subs, ok := msg["subs"]
 					if ok {
@@ -386,10 +392,16 @@ func (c *Client) inboxManager() {
 							c.calls[sub.(string)].done()
 						}
 					}
+				case "added":
+					c.collectionBy(msg).added(msg)
+				case "changed":
+					c.collectionBy(msg).changed(msg)
+				case "removed":
+					c.collectionBy(msg).removed(msg)
 				case "addedBefore":
-					log.Println(mtype, msg)
+					c.collectionBy(msg).addedBefore(msg)
 				case "movedBefore":
-					log.Println(mtype, msg)
+					c.collectionBy(msg).movedBefore(msg)
 
 				// RPC
 				case "result":
@@ -421,6 +433,27 @@ func (c *Client) inboxManager() {
 	}
 }
 
+func (c *Client) collectionBy(msg map[string]interface{}) Collection {
+	n, ok := msg["collection"]
+	if !ok {
+		return NewMockCollection()
+	}
+	var collection Collection
+	switch name := n.(type) {
+	case string:
+		collection, ok = c.Collections[name]
+		if !ok {
+			collection = NewCollection(name)
+			c.Collections[name] = collection
+		}
+	default:
+		log.Printf("Error - collection name has non-string type %#v", n)
+		return NewMockCollection()
+	}
+
+	return collection
+}
+
 // inboxWorker pulls messages from a websocket, decodes JSON packets, and
 // stuffs them into a message channel.
 func (c *Client) inboxWorker() {
@@ -442,8 +475,12 @@ func (c *Client) inboxWorker() {
 		} else {
 			log.Printf("<- %s\n", string(data))
 		}
-
-		c.inbox <- event.(map[string]interface{})
+		if event == nil {
+			log.Println("Received empty event")
+			break
+		} else {
+			c.inbox <- event.(map[string]interface{})
+		}
 	}
 	// Spawn a reconnect
 	c.Reconnect()

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"time"
 
@@ -28,5 +29,11 @@ func main() {
 	}
 	for {
 		time.Sleep(10 * time.Second)
+		log.Println("builds", len(client.Collections["builds"].FindAll()))
+		for key, value := range client.Collections["builds"].FindAll() {
+			log.Println(key)
+			data, _ := json.Marshal(value)
+			log.Println(string(data))
+		}
 	}
 }
