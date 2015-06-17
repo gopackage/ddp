@@ -224,19 +224,13 @@ func (call *Call) done() {
 	}
 }
 
-// Go invokes the function asynchronously.  It returns the Call structure representing
-// the invocation.  The done channel will signal when the call is complete by returning
-// the same Call object.  If done is nil, Go will allocate a new channel.
-// If non-nil, done must be buffered or Go will deliberately crash.
-//
-// Go and Call are modeled after the standard `net/rpc` package versions.
-func (c *Client) Go(serviceMethod string, args []interface{}, reply interface{}, done chan *Call) *Call {
-
+// Sub subscribes to data updates.
+func (c *Client) Sub(subName string, args []interface{}, done chan *Call) *Call {
 	call := new(Call)
 	call.ID = c.newID()
-	call.ServiceMethod = serviceMethod
+	call.ServiceMethod = subName
 	call.Args = args
-	call.Reply = reply
+	call.Owner = c
 	if done == nil {
 		done = make(chan *Call, 10) // buffered.
 	} else {
@@ -251,15 +245,53 @@ func (c *Client) Go(serviceMethod string, args []interface{}, reply interface{},
 	call.Done = done
 	c.calls[call.ID] = call
 
-	//c.ws.Write(call)
+	c.Send(NewSub(call.ID, subName, args))
+
+	return call
+}
+
+// SubCall sends a synchronous subscription request to the server.
+func (c *Client) SubCall(subName string, args []interface{}) error {
+	call := <-c.Sub(subName, args, make(chan *Call, 1)).Done
+	return call.Error
+}
+
+// Go invokes the function asynchronously.  It returns the Call structure representing
+// the invocation.  The done channel will signal when the call is complete by returning
+// the same Call object.  If done is nil, Go will allocate a new channel.
+// If non-nil, done must be buffered or Go will deliberately crash.
+//
+// Go and Call are modeled after the standard `net/rpc` package versions.
+func (c *Client) Go(serviceMethod string, args []interface{}, done chan *Call) *Call {
+
+	call := new(Call)
+	call.ID = c.newID()
+	call.ServiceMethod = serviceMethod
+	call.Args = args
+	call.Owner = c
+	if done == nil {
+		done = make(chan *Call, 10) // buffered.
+	} else {
+		// If caller passes done != nil, it must arrange that
+		// done has enough buffer for the number of simultaneous
+		// RPCs that will be using that channel.  If the channel
+		// is totally unbuffered, it's best not to run at all.
+		if cap(done) == 0 {
+			log.Panic("ddp.rpc: done channel is unbuffered")
+		}
+	}
+	call.Done = done
+	c.calls[call.ID] = call
+
+	c.Send(NewMethod(call.ID, serviceMethod, args))
 
 	return call
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
-func (c *Client) Call(serviceMethod string, args []interface{}, reply interface{}) error {
-	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (c *Client) Call(serviceMethod string, args []interface{}) (interface{}, error) {
+	call := <-c.Go(serviceMethod, args, make(chan *Call, 1)).Done
+	return call.Reply, call.Error
 }
 
 // Ping sends a heartbeat signal to the server. The Ping doesn't look for
@@ -296,6 +328,13 @@ func (c *Client) PingPong(id string, timeout time.Duration, handler func(error))
 
 // Send transmits messages to the server.
 func (c *Client) Send(msg interface{}) (int, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("-> %#v", err)
+	} else {
+		log.Printf("-> %s\n", string(data))
+	}
+
 	switch msg.(type) {
 	case []byte:
 		return c.ws.Write(msg.([]byte))
@@ -327,7 +366,7 @@ func (c *Client) newID() string {
 // defaultClient creates a default Client.
 func defaultClient(ws *websocket.Conn, url, origin string) *Client {
 	c := &Client{
-		HeartbeatInterval: 30 * time.Second, // Meteor impl default - 5 (we ping first)
+		HeartbeatInterval: 45 * time.Second, // Meteor impl default + 10 (we ping last)
 		HeartbeatTimeout:  15 * time.Second, // Meteor impl default
 		ReconnectInterval: 5 * time.Second,
 		ws:                ws,
@@ -338,6 +377,7 @@ func defaultClient(ws *websocket.Conn, url, origin string) *Client {
 		inboxDone:         make(chan bool, 0),
 		pings:             map[string][]*pingTracker{},
 		idMutex:           new(sync.Mutex),
+		calls:             map[string]*Call{},
 	}
 	c.encoder = json.NewEncoder(ws)
 	return c
@@ -384,6 +424,7 @@ func (c *Client) inboxManager() {
 				// Live Data
 				case "nosub":
 					log.Println(mtype, msg)
+					// TODO callback an error
 				case "added":
 					log.Println(mtype, msg)
 				case "changed":
@@ -391,7 +432,12 @@ func (c *Client) inboxManager() {
 				case "removed":
 					log.Println(mtype, msg)
 				case "ready":
-					log.Println(mtype, msg)
+					subs, ok := msg["subs"]
+					if ok {
+						for _, sub := range subs.([]interface{}) {
+							c.calls[sub.(string)].done()
+						}
+					}
 				case "addedBefore":
 					log.Println(mtype, msg)
 				case "movedBefore":
@@ -399,7 +445,17 @@ func (c *Client) inboxManager() {
 
 				// RPC
 				case "result":
-					log.Println(mtype, msg)
+					id, ok := msg["id"]
+					if ok {
+						call := c.calls[id.(string)]
+						e, ok := msg["error"]
+						if ok {
+							call.Error = fmt.Errorf(e.(string))
+						} else {
+							call.Reply = msg["result"]
+						}
+						call.done()
+					}
 				case "updated":
 					log.Println(mtype, msg)
 
@@ -432,6 +488,13 @@ func (c *Client) inboxWorker() {
 		if c.pingTimer != nil {
 			c.pingTimer.Reset(c.HeartbeatInterval)
 		}
+		data, err := json.Marshal(event)
+		if err != nil {
+			log.Printf("<- %#v", err)
+		} else {
+			log.Printf("<- %s\n", string(data))
+		}
+
 		c.inbox <- event.(map[string]interface{})
 	}
 	// Spawn a reconnect

@@ -15,9 +15,17 @@ func main() {
 	defer client.Close()
 
 	log.Println("Connected", client.Version(), client.Session())
-	client.Write([]byte("{\"msg\":\"sub\",\"id\":\"100\",\"name\":\"builds\",\"params\":[\"abc\"]}"))
+	err = client.SubCall("builds", []interface{}{"abc"})
+	if err != nil {
+		log.Fatalln(err)
+	}
 	time.Sleep(10 * time.Second)
-	client.Write([]byte("{\"msg\":\"method\",\"method\":\"ping\",\"params\":[\"hello\"],\"id\":\"200\"}"))
+	response, err := client.Call("ping", []interface{}{"hello"})
+	if err != nil {
+		log.Fatalln(err)
+	} else {
+		log.Println("PING", response)
+	}
 	for {
 		time.Sleep(10 * time.Second)
 	}

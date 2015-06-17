@@ -48,3 +48,35 @@ type Pong Message
 func NewPong(id string) *Pong {
 	return &Pong{Type: "pong", ID: id}
 }
+
+// Method is used to send a remote procedure call to the server.
+type Method struct {
+	Message
+	ServiceMethod string        `json:"method"`
+	Args          []interface{} `json:"params"`
+}
+
+// NewMethod creates a new method invocation object.
+func NewMethod(id, serviceMethod string, args []interface{}) *Method {
+	return &Method{
+		Message:       Message{Type: "method", ID: id},
+		ServiceMethod: serviceMethod,
+		Args:          args,
+	}
+}
+
+// Sub is used to send a subscription request to the server.
+type Sub struct {
+	Message
+	SubName string        `json:"name"`
+	Args    []interface{} `json:"params"`
+}
+
+// NewSub creates a new sub object.
+func NewSub(id, subName string, args []interface{}) *Sub {
+	return &Sub{
+		Message: Message{Type: "sub", ID: id},
+		SubName: subName,
+		Args:    args,
+	}
+}
