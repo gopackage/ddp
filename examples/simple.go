@@ -15,7 +15,7 @@ func main() {
 	defer client.Close()
 
 	log.Println("Connected", client.Version(), client.Session())
-	err = client.SubCall("builds", []interface{}{"abc"})
+	err = client.Sub("builds", []interface{}{"abc"})
 	if err != nil {
 		log.Fatalln(err)
 	}
