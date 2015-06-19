@@ -22,6 +22,25 @@ type Client struct {
 	// Collections contains all the collections currently subscribed
 	Collections map[string]Collection
 
+	// writeStats controls statistics gathering for current websocket writes.
+	writeSocketStats *WriterStats
+	// writeStats controls statistics gathering for overall client writes.
+	writeStats *WriterStats
+	// writeLog controls logging for client writes.
+	writeLog *WriterLogger
+	// readStats controls statistics gathering for current websocket reads.
+	readSocketStats *ReaderStats
+	// readStats controls statistics gathering for overall client reads.
+	readStats *ReaderStats
+	// readLog control logging for clietn reads.
+	readLog *ReaderLogger
+	// reconnects in the number of reconnections the client has made
+	reconnects int64
+	// pingsIn is the number of pings received from the server
+	pingsIn int64
+	// pingsOut is te number of pings sent by the client
+	pingsOut int64
+
 	// session contains the DDP session token (can be used for reconnects and debugging).
 	session string
 	// version contains the negotiated DDP protocol version in use.
@@ -38,8 +57,6 @@ type Client struct {
 	inbox chan map[string]interface{}
 	// errors is an incoming errors channel
 	errors chan error
-	// inboxDone is a channel to control the inbox worker
-	inboxDone chan bool
 	// pingTimer is a timer for sending regular pings to the server
 	pingTimer *time.Timer
 	// pings tracks inflight pings based on each ping ID.
@@ -78,51 +95,32 @@ func NewClient(url, origin string) (*Client, error) {
 		origin:            origin,
 		inbox:             make(chan map[string]interface{}, 100),
 		errors:            make(chan error, 100),
-		inboxDone:         make(chan bool, 0),
 		pings:             map[string][]*pingTracker{},
 		calls:             map[string]*Call{},
 		subs:              map[string][]interface{}{},
-		idManager:         *newidManager(),
-	}
-	c.encoder = json.NewEncoder(ws)
 
-	// We spin off an inbox stuffing goroutine
-	go c.inboxWorker()
+		// Stats
+		writeSocketStats: NewWriterStats(nil),
+		writeStats:       NewWriterStats(nil),
+		readSocketStats:  NewReaderStats(nil),
+		readStats:        NewReaderStats(nil),
+
+		// Loggers
+		writeLog: NewWriterTextLogger(nil),
+		readLog:  NewReaderTextLogger(nil),
+
+		idManager: *newidManager(),
+	}
+	c.encoder = json.NewEncoder(c.writeStats)
+	c.SetSocketLogActive(false)
+
+	// We spin off an inbox processing goroutine
+	go c.inboxManager()
 
 	// Start DDP connection
-	c.Send(NewConnect())
-	// Read until we get a response - it will either be `connected` or `failed`
-	// The server may send a message without the `msg` key (which should be ignored).
-	for {
-		select {
-		case msg := <-c.inbox:
-			// Message!
-			mtype, ok := msg["msg"]
-			if ok {
-				switch mtype.(string) {
-				case "connected":
-					c.version = "1" // Currently the only version we support
-					c.session = msg["session"].(string)
-					// Start automatic heartbeats
-					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
-						c.Ping()
-						c.pingTimer.Reset(c.HeartbeatInterval)
-					})
-					// Start manager
-					go c.inboxManager()
-					return c, nil
-				case "failed":
-					return nil, fmt.Errorf("Failed to connect, we support version 1 but server supports %s", msg["version"])
-				default:
-					// Ignore?
-					log.Println("Unexpected connection message", msg)
-				}
-			}
-		case err := <-c.errors:
-			c.ws.Close()
-			return nil, err
-		}
-	}
+	c.start(ws, NewConnect())
+
+	return c, nil
 }
 
 // Session returns the negotiated session token for the connection.
@@ -145,7 +143,11 @@ func (c *Client) Version() string {
 // and are supposed to be idempotent
 func (c *Client) Reconnect() {
 	log.Println("Reconnecting...")
+
 	c.Close()
+
+	c.reconnects++
+
 	// Reconnect
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
@@ -156,54 +158,9 @@ func (c *Client) Reconnect() {
 	}
 	log.Println("Dialed")
 
-	c.ws = ws
-	// We spin off an inbox stuffing goroutine
-	go c.inboxWorker()
-
-	// Start DDP connection
-	c.Send(NewReconnect(c.session))
+	c.start(ws, NewReconnect(c.session))
 
 	log.Println("Attempted to resume session")
-
-	// Read until we get a response - it will either be `connected` or `failed`
-	// The server may send a message without the `msg` key (which should be ignored).
-	for {
-		select {
-		case msg := <-c.inbox:
-			// Message!
-			mtype, ok := msg["msg"]
-			if ok {
-				switch mtype.(string) {
-				case "connected":
-					c.version = "1" // Currently the only version we support
-					c.session = msg["session"].(string)
-					// Start automatic heartbeats
-					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
-						c.Ping()
-						c.pingTimer.Reset(c.HeartbeatInterval)
-					})
-					// Start manager
-					go c.inboxManager()
-					log.Println("Reconnected")
-					return
-				case "failed":
-					log.Printf("Failed to connect, we support version 1 but server supports %s", msg["version"])
-					// Reconnect again after set interval
-					time.AfterFunc(c.ReconnectInterval, c.Reconnect)
-					return
-				default:
-					// Ignore?
-					log.Println("Unexpected connection message", msg)
-				}
-			}
-		case err := <-c.errors:
-			c.ws.Close()
-			log.Println("Reconnection error", err)
-			// Reconnect again after set interval
-			time.AfterFunc(c.ReconnectInterval, c.Reconnect)
-			return
-		}
-	}
 }
 
 // Subscribe subscribes to data updates.
@@ -288,7 +245,8 @@ func (c *Client) Ping() {
 	c.PingPong(c.newID(), c.HeartbeatTimeout, func(err error) {
 		if err != nil {
 			// Is there anything else we should or can do?
-			c.Reconnect()
+			log.Println("ping reconnect", err)
+			go c.Reconnect()
 		}
 	})
 }
@@ -298,11 +256,12 @@ func (c *Client) Ping() {
 // track the responses - or an empty string can be used. It is the
 // responsibility of the caller to respond to any errors that may occur.
 func (c *Client) PingPong(id string, timeout time.Duration, handler func(error)) {
-	_, err := c.Send(NewPing(id))
+	err := c.Send(NewPing(id))
 	if err != nil {
 		handler(err)
 		return
 	}
+	c.pingsOut++
 	pings, ok := c.pings[id]
 	if !ok {
 		pings = make([]*pingTracker, 0, 5)
@@ -313,46 +272,119 @@ func (c *Client) PingPong(id string, timeout time.Duration, handler func(error))
 	c.pings[id] = append(pings, tracker)
 }
 
-// Send transmits messages to the server.
-func (c *Client) Send(msg interface{}) (int, error) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("-> %#v", err)
-	} else {
-		log.Printf("-> %s\n", string(data))
-	}
-
-	switch msg.(type) {
-	case []byte:
-		return c.ws.Write(msg.([]byte))
-	default:
-		return -1, c.encoder.Encode(msg)
-	}
+// Send transmits messages to the server. The msg parameter must be json
+// encoder compatible.
+func (c *Client) Send(msg interface{}) error {
+	return c.encoder.Encode(msg)
 }
 
-// Close implements the io.Closer interface. The Close call blocks
-// while the inbox manager finishes processing it's messages. If
-// Close is called on an already closed client, the Close call will
-// block until the client is running again and the Close call succeeds.
+// Close implements the io.Closer interface.
 func (c *Client) Close() {
 	// Shutdown out all outstanding pings
 	c.pingTimer.Stop()
 	// Close websocket
 	c.ws.Close()
-	// Stop inbox manager - this blocks while the inbox manager is running
-	c.inboxDone <- true
+	c.ws = nil
+}
+
+// ResetStats resets the statistics for the client.
+func (c *Client) ResetStats() {
+	c.readSocketStats.Reset()
+	c.readStats.Reset()
+	c.writeSocketStats.Reset()
+	c.writeStats.Reset()
+	c.reconnects = 0
+	c.pingsIn = 0
+	c.pingsOut = 0
+}
+
+// Stats returns the read and write statistics of the client.
+func (c *Client) Stats() *ClientStats {
+	return &ClientStats{
+		Reads:       c.readSocketStats.Snapshot(),
+		TotalReads:  c.readStats.Snapshot(),
+		Writes:      c.writeSocketStats.Snapshot(),
+		TotalWrites: c.writeStats.Snapshot(),
+		Reconnects:  c.reconnects,
+		PingsSent:   c.pingsOut,
+		PingsRecv:   c.pingsIn,
+	}
+}
+
+// SocketLogActive returns the current logging status for the socket.
+func (c *Client) SocketLogActive() bool {
+	return c.writeLog.Active
+}
+
+// SetSocketLogActive to true to enable logging of raw socket data.
+func (c *Client) SetSocketLogActive(active bool) {
+	c.writeLog.Active = active
+	c.readLog.Active = active
+}
+
+// ClientStats displays combined statistics for the Client.
+type ClientStats struct {
+	// Reads provides statistics on the raw i/o network reads for the current connection.
+	Reads *Stats
+	// Reads provides statistics on the raw i/o network reads for the all client connections.
+	TotalReads *Stats
+	// Writes provides statistics on the raw i/o network writes for the current connection.
+	Writes *Stats
+	// Writes provides statistics on the raw i/o network writes for all the client connections.
+	TotalWrites *Stats
+	// Reconnects is the number of reconnections the client has made.
+	Reconnects int64
+	// PingsSent is the number of pings sent by the client
+	PingsSent int64
+	// PingsRecv is the number of pings received by the client
+	PingsRecv int64
+}
+
+// start starts a new client connection on the provided websocket
+func (c *Client) start(ws *websocket.Conn, connect *Connect) {
+
+	c.ws = ws
+	c.writeLog.SetWriter(ws)
+	c.writeSocketStats = NewWriterStats(c.writeLog)
+	c.writeStats.SetWriter(c.writeSocketStats)
+	c.readLog.SetReader(ws)
+	c.readSocketStats = NewReaderStats(c.readLog)
+	c.readStats.SetReader(c.readSocketStats)
+
+	// We spin off an inbox stuffing goroutine
+	go c.inboxWorker(c.readStats)
+
+	c.Send(connect)
 }
 
 // inboxManager pulls messages from the inbox and routes them to appropriate
 // handlers.
 func (c *Client) inboxManager() {
+	log.Println("IM Inbox manager starting")
 	for {
+		log.Println("IM top")
 		select {
 		case msg := <-c.inbox:
 			// Message!
 			mtype, ok := msg["msg"]
 			if ok {
 				switch mtype.(string) {
+
+				// Connection management
+				case "connected":
+					c.version = "1" // Currently the only version we support
+					c.session = msg["session"].(string)
+					// Start automatic heartbeats
+					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
+						log.Println("PT ping")
+						c.Ping()
+						c.pingTimer.Reset(c.HeartbeatInterval)
+					})
+					log.Println("IM Connected msg", c.version, c.session)
+				case "failed":
+					log.Printf("IM Failed to connect, we support version 1 but server supports %s", msg["version"])
+					// Reconnect again after set interval
+					time.AfterFunc(c.ReconnectInterval, c.Reconnect)
 
 				// Heartbeats
 				case "ping":
@@ -363,6 +395,7 @@ func (c *Client) inboxManager() {
 					} else {
 						c.Send(NewPong(""))
 					}
+					c.pingsIn++
 				case "pong":
 					// We received a pong - we can clear the ping tracker and call its handler
 					id, ok := msg["id"]
@@ -387,9 +420,15 @@ func (c *Client) inboxManager() {
 					// TODO callback an error
 				case "ready":
 					subs, ok := msg["subs"]
+					log.Println("IM ready subs", subs, ok)
 					if ok {
 						for _, sub := range subs.([]interface{}) {
-							c.calls[sub.(string)].done()
+							log.Println("IM scanning sub", sub)
+							call, ok := c.calls[sub.(string)]
+							if ok {
+								log.Println("IM sub done", call.ServiceMethod)
+								call.done()
+							}
 						}
 					}
 				case "added":
@@ -417,19 +456,19 @@ func (c *Client) inboxManager() {
 						call.done()
 					}
 				case "updated":
-					log.Println(mtype, msg)
+					log.Println("IM", mtype, msg)
 
 				default:
 					// Ignore?
-					log.Println("Unexpected message", msg)
+					log.Println("IM Unexpected message", msg)
 				}
+			} else {
+				log.Println("IM message with no `msg` field")
 			}
 		case err := <-c.errors:
-			log.Println("Error", err)
-		case _ = <-c.inboxDone:
-			log.Println("Inbox finished processing")
-			break
+			log.Println("IM Error", err)
 		}
+		log.Println("IM bottom")
 	}
 }
 
@@ -456,12 +495,14 @@ func (c *Client) collectionBy(msg map[string]interface{}) Collection {
 
 // inboxWorker pulls messages from a websocket, decodes JSON packets, and
 // stuffs them into a message channel.
-func (c *Client) inboxWorker() {
-	dec := json.NewDecoder(c.ws)
+func (c *Client) inboxWorker(ws io.Reader) {
+	log.Println("IW Inbox worker starting")
+	dec := json.NewDecoder(ws)
 	for {
 		var event interface{}
 
 		if err := dec.Decode(&event); err == io.EOF {
+			log.Printf("IW Connection closed")
 			break
 		} else if err != nil {
 			c.errors <- err
@@ -469,19 +510,22 @@ func (c *Client) inboxWorker() {
 		if c.pingTimer != nil {
 			c.pingTimer.Reset(c.HeartbeatInterval)
 		}
-		data, err := json.Marshal(event)
-		if err != nil {
-			log.Printf("<- %#v", err)
-		} else {
-			log.Printf("<- %s\n", string(data))
-		}
 		if event == nil {
-			log.Println("Received empty event")
+			log.Println("IW Received empty event")
 			break
 		} else {
+			log.Println("IW Queue event")
 			c.inbox <- event.(map[string]interface{})
+			log.Println("IW Queued event")
 		}
 	}
+	log.Println("IW Inbox worker stopping")
+
 	// Spawn a reconnect
-	c.Reconnect()
+	time.AfterFunc(3*time.Second, func() {
+		log.Println("IW after reconnect")
+		c.Reconnect()
+	})
+
+	log.Println("IW Inbox worker stopped")
 }
