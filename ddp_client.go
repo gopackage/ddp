@@ -45,6 +45,8 @@ type Client struct {
 	session string
 	// version contains the negotiated DDP protocol version in use.
 	version string
+	// serverID the cluster node ID for the server we connected to
+	serverID string
 	// ws is the underlying websocket being used.
 	ws *websocket.Conn
 	// encoder is a JSON encoder to send outgoing packets to the websocket.
@@ -141,8 +143,8 @@ func (c *Client) Version() string {
 // active and any methods that may have been in flight as the resumed session
 // does not resume subscriptions and methods may or may not have been sent
 // and are supposed to be idempotent
+// TODO reconnect should not allow more reconnects while a reconnection is already in progress.
 func (c *Client) Reconnect() {
-	log.Println("Reconnecting...")
 
 	c.Close()
 
@@ -156,11 +158,8 @@ func (c *Client) Reconnect() {
 		time.AfterFunc(c.ReconnectInterval, c.Reconnect)
 		return
 	}
-	log.Println("Dialed")
 
 	c.start(ws, NewReconnect(c.session))
-
-	log.Println("Attempted to resume session")
 }
 
 // Subscribe subscribes to data updates.
@@ -245,7 +244,6 @@ func (c *Client) Ping() {
 	c.PingPong(c.newID(), c.HeartbeatTimeout, func(err error) {
 		if err != nil {
 			// Is there anything else we should or can do?
-			log.Println("ping reconnect", err)
 			go c.Reconnect()
 		}
 	})
@@ -360,9 +358,7 @@ func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 // inboxManager pulls messages from the inbox and routes them to appropriate
 // handlers.
 func (c *Client) inboxManager() {
-	log.Println("IM Inbox manager starting")
 	for {
-		log.Println("IM top")
 		select {
 		case msg := <-c.inbox:
 			// Message!
@@ -380,11 +376,8 @@ func (c *Client) inboxManager() {
 						c.Ping()
 						c.pingTimer.Reset(c.HeartbeatInterval)
 					})
-					log.Println("IM Connected msg", c.version, c.session)
 				case "failed":
-					log.Printf("IM Failed to connect, we support version 1 but server supports %s", msg["version"])
-					// Reconnect again after set interval
-					time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+					log.Fatalf("IM Failed to connect, we support version 1 but server supports %s", msg["version"])
 
 				// Heartbeats
 				case "ping":
@@ -416,17 +409,14 @@ func (c *Client) inboxManager() {
 
 				// Live Data
 				case "nosub":
-					log.Println(mtype, msg)
-					// TODO callback an error
+					log.Println("Subscription returned a nosub error", msg)
+					// TODO clear related subscriptions
 				case "ready":
 					subs, ok := msg["subs"]
-					log.Println("IM ready subs", subs, ok)
 					if ok {
 						for _, sub := range subs.([]interface{}) {
-							log.Println("IM scanning sub", sub)
 							call, ok := c.calls[sub.(string)]
 							if ok {
-								log.Println("IM sub done", call.ServiceMethod)
 								call.done()
 							}
 						}
@@ -456,19 +446,31 @@ func (c *Client) inboxManager() {
 						call.done()
 					}
 				case "updated":
-					log.Println("IM", mtype, msg)
+					// We currently don't do anything with updated status
 
 				default:
 					// Ignore?
-					log.Println("IM Unexpected message", msg)
+					log.Println("Server sent unexpected message", msg)
 				}
 			} else {
-				log.Println("IM message with no `msg` field")
+				// Current Meteor server sends an undocumented DDP message
+				// (looks like clustering "hint"). We will register and
+				// ignore rather than log an error.
+				serverID, ok := msg["server_id"]
+				if ok {
+					switch ID := serverID.(type) {
+					case string:
+						c.serverID = ID
+					default:
+						log.Println("Server cluster node", serverID)
+					}
+				} else {
+					log.Println("Server sent message with no `msg` field", msg)
+				}
 			}
 		case err := <-c.errors:
-			log.Println("IM Error", err)
+			log.Println("Websocket error", err)
 		}
-		log.Println("IM bottom")
 	}
 }
 
@@ -486,7 +488,6 @@ func (c *Client) collectionBy(msg map[string]interface{}) Collection {
 			c.Collections[name] = collection
 		}
 	default:
-		log.Printf("Error - collection name has non-string type %#v", n)
 		return NewMockCollection()
 	}
 
@@ -496,13 +497,11 @@ func (c *Client) collectionBy(msg map[string]interface{}) Collection {
 // inboxWorker pulls messages from a websocket, decodes JSON packets, and
 // stuffs them into a message channel.
 func (c *Client) inboxWorker(ws io.Reader) {
-	log.Println("IW Inbox worker starting")
 	dec := json.NewDecoder(ws)
 	for {
 		var event interface{}
 
 		if err := dec.Decode(&event); err == io.EOF {
-			log.Printf("IW Connection closed")
 			break
 		} else if err != nil {
 			c.errors <- err
@@ -511,21 +510,15 @@ func (c *Client) inboxWorker(ws io.Reader) {
 			c.pingTimer.Reset(c.HeartbeatInterval)
 		}
 		if event == nil {
-			log.Println("IW Received empty event")
+			log.Println("Inbox worker found nil event. May be due to broken websocket. Reconnecting.")
 			break
 		} else {
-			log.Println("IW Queue event")
 			c.inbox <- event.(map[string]interface{})
-			log.Println("IW Queued event")
 		}
 	}
-	log.Println("IW Inbox worker stopping")
 
 	// Spawn a reconnect
 	time.AfterFunc(3*time.Second, func() {
-		log.Println("IW after reconnect")
 		c.Reconnect()
 	})
-
-	log.Println("IW Inbox worker stopped")
 }

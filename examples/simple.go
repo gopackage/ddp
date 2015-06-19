@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"time"
 
@@ -14,17 +15,28 @@ func main() {
 	}
 	defer client.Close()
 
-	log.Println("Connected", client.Version(), client.Session())
 	err = client.Sub("builds", []interface{}{"abc"})
 	if err != nil {
 		log.Fatalln(err)
 	}
-	time.Sleep(10 * time.Second)
+
+	// We know client.Sub is synchronous and will only respond after we connect.
+	log.Printf("Connected DDP version: %s session: %s", client.Version(), client.Session())
+
+	log.Println("Collection: builds", len(client.Collections["builds"].FindAll()))
+	for key, value := range client.Collections["builds"].FindAll() {
+		log.Println(key)
+		data, _ := json.Marshal(value)
+		log.Println(string(data))
+	}
+
+	time.Sleep(5 * time.Second)
+	log.Printf("Sending RPC method call to 'ping' service")
 	response, err := client.Call("ping", []interface{}{"hello"})
 	if err != nil {
 		log.Fatalln(err)
 	} else {
-		log.Println("PING", response)
+		log.Println("Ping response:", response)
 	}
 	for {
 		stats := client.Stats()
@@ -32,7 +44,7 @@ func main() {
 		ti := stats.TotalReads
 		o := stats.Writes
 		to := stats.TotalWrites
-		log.Printf("b: %d/%d##%d/%d ops: %d/%d##%d/%d err: %d/%d##%d/%d recon: %d pings: %d/%d time: %v##%v",
+		log.Printf("bytes: %d/%d##%d/%d ops: %d/%d##%d/%d err: %d/%d##%d/%d reconnects: %d pings: %d/%d uptime: %v##%v",
 			i.Bytes, o.Bytes,
 			ti.Bytes, to.Bytes,
 			i.Ops, o.Ops,
@@ -43,13 +55,5 @@ func main() {
 			stats.PingsRecv, stats.PingsSent,
 			i.Runtime, ti.Runtime)
 		time.Sleep(1 * time.Minute)
-		/*
-			log.Println("builds", len(client.Collections["builds"].FindAll()))
-			for key, value := range client.Collections["builds"].FindAll() {
-				log.Println(key)
-				data, _ := json.Marshal(value)
-				log.Println(string(data))
-			}
-		*/
 	}
 }

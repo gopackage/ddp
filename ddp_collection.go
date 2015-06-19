@@ -1,7 +1,5 @@
 package ddp
 
-import "log"
-
 // Collection managed cached collection data sent from the server in a
 // livedata subscription.
 //
@@ -44,7 +42,6 @@ type KeyCache struct {
 func (c *KeyCache) added(msg map[string]interface{}) {
 	id := idForMessage(msg)
 	c.items[id] = msg["fields"]
-	log.Printf("db.%s insert %s\n", c.Name, id)
 }
 
 func (c *KeyCache) changed(msg map[string]interface{}) {
@@ -76,7 +73,6 @@ func (c *KeyCache) changed(msg map[string]interface{}) {
 func (c *KeyCache) removed(msg map[string]interface{}) {
 	id := idForMessage(msg)
 	delete(c.items, id)
-	log.Printf("db.%s remove %s\n", c.Name, id)
 }
 
 func (c *KeyCache) addedBefore(msg map[string]interface{}) {
