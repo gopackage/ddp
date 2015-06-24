@@ -1,5 +1,124 @@
 package ddp
 
+import "fmt"
+
+// ----------------------------------------------------------------------
+// EJSON document interface
+// ----------------------------------------------------------------------
+
+// Doc provides hides the complexity of ejson documents.
+type Doc struct {
+	root interface{}
+}
+
+// NewDoc creates a new document from a generic json parsed document.
+func NewDoc(in interface{}) *Doc {
+	doc := &Doc{in}
+	return doc
+}
+
+// GetMapForPath locates a map[string]interface{} - json object - at a path
+// or returns an error.
+func (d *Doc) GetMapForPath(path []string) (map[string]interface{}, error) {
+	item, err := d.ItemForPath(path)
+	if err != nil {
+		return nil, err
+	}
+	switch m := item.(type) {
+	case map[string]interface{}:
+		return m, nil
+	default:
+		return nil, fmt.Errorf("Non-map found at path %+v", item)
+	}
+}
+
+// MapForPath sets a map[string]interface{} - json object - at a path or returns
+// an error.
+func (d *Doc) MapForPath(path []string, value map[string]interface{}) error {
+	dir, key, err := d.DirForPath(path)
+	if err != nil {
+		return err
+	}
+	dir[key] = value
+	return nil
+}
+
+// GetStringForPath returns a string value for the path or an error if the
+// string was found.
+func (d *Doc) GetStringForPath(path []string) (string, error) {
+	dir, key, err := d.DirForPath(path)
+	if err != nil {
+		return "", err
+	}
+	value := dir[key]
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	default:
+		return "", fmt.Errorf("Item at path was not a string, found %+v instead", value)
+	}
+}
+
+// StringForPath sets a string value on the path.
+// Returns a non-nil error if the value could not be set.
+func (d *Doc) StringForPath(value, path []string) error {
+	dir, key, err := d.DirForPath(path)
+	if err != nil {
+		return err
+	}
+	dir[key] = value
+	return nil
+}
+
+// ItemForPath locates the "raw" item at the provided path, returning
+// the item found or an error.
+func (d *Doc) ItemForPath(path []string) (item interface{}, err error) {
+	item = d.root
+	for _, step := range path {
+		// This is an intermediate step - we must be in a map
+		switch m := item.(type) {
+		case map[string]interface{}:
+			item = m[step]
+		default:
+			return nil, fmt.Errorf("Path contains non-object %s", step)
+		}
+	}
+	return item, nil
+}
+
+// DirForPath locates a map[string]interface{} - json object - at the
+// directory contained in the path and returns the map and key/file name
+// specified or an error.
+func (d *Doc) DirForPath(path []string) (dir map[string]interface{}, key string, err error) {
+	var parent []string
+	parent, key, err = d.Split(path)
+	if err != nil {
+		return nil, "", err
+	}
+	dir, err = d.GetMapForPath(parent)
+	if err != nil {
+		return nil, "", err
+	}
+	return
+}
+
+// Split splits a path returning the parts of the path directory and the
+// last item (key/file). An empty path results in an error.
+func (d *Doc) Split(path []string) (dir []string, file string, err error) {
+	if len(path) == 0 {
+		return nil, "", fmt.Errorf("Empty path")
+	}
+	last := len(path) - 1
+	dir = path[:last]
+	file = path[last]
+	err = nil
+	return
+}
+
+// ----------------------------------------------------------------------
+// Collection
+// ----------------------------------------------------------------------
+
 // Collection managed cached collection data sent from the server in a
 // livedata subscription.
 //
