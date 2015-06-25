@@ -23,11 +23,16 @@ func main() {
 	// We know client.Sub is synchronous and will only respond after we connect.
 	log.Printf("Connected DDP version: %s session: %s", client.Version(), client.Session())
 
-	log.Println("Collection: builds", len(client.Collections["builds"].FindAll()))
-	for key, value := range client.Collections["builds"].FindAll() {
-		log.Println(key)
-		data, _ := json.Marshal(value)
-		log.Println(string(data))
+	builds, ok := client.Collections["builds"]
+	if ok {
+		log.Println("Collection: builds", len(builds.FindAll()))
+		for key, value := range builds.FindAll() {
+			log.Println(key)
+			data, _ := json.Marshal(value)
+			log.Println(string(data))
+		}
+	} else {
+		log.Println("Collection: builds missing")
 	}
 
 	time.Sleep(5 * time.Second)
@@ -54,6 +59,13 @@ func main() {
 			stats.Reconnects,
 			stats.PingsRecv, stats.PingsSent,
 			i.Runtime, ti.Runtime)
-		time.Sleep(1 * time.Minute)
+		builds, ok = client.Collections["builds"]
+		if ok {
+			log.Println("Collection: builds", len(builds.FindAll()))
+		} else {
+			log.Println("Collection: builds missing")
+		}
+
+		time.Sleep(10 * time.Second)
 	}
 }

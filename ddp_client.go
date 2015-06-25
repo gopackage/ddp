@@ -66,7 +66,7 @@ type Client struct {
 	// calls tracks method invocations that are still in flight
 	calls map[string]*Call
 	// subs tracks active subscriptions. Map contains name->args
-	subs map[string][]interface{}
+	subs map[string]*Call
 
 	// idManager tracks IDs for ddp messages
 	idManager
@@ -99,7 +99,7 @@ func NewClient(url, origin string) (*Client, error) {
 		errors:            make(chan error, 100),
 		pings:             map[string][]*pingTracker{},
 		calls:             map[string]*Call{},
-		subs:              map[string][]interface{}{},
+		subs:              map[string]*Call{},
 
 		// Stats
 		writeSocketStats: NewWriterStats(nil),
@@ -139,10 +139,6 @@ func (c *Client) Version() string {
 // DDP session.
 //
 // TODO needs a reconnect backoff so we don't trash a down server
-// TODO reconnect should also track and resend any subscriptions that are
-// active and any methods that may have been in flight as the resumed session
-// does not resume subscriptions and methods may or may not have been sent
-// and are supposed to be idempotent
 // TODO reconnect should not allow more reconnects while a reconnection is already in progress.
 func (c *Client) Reconnect() {
 
@@ -160,6 +156,27 @@ func (c *Client) Reconnect() {
 	}
 
 	c.start(ws, NewReconnect(c.session))
+
+	// --------------------------------------------------------------------
+	// We resume inflight or ongoing subscriptions - we don't have to wait
+	// for connection confirmation (messages can be pipelined).
+	// --------------------------------------------------------------------
+
+	// Send calls that haven't been confirmed - may not have been sent
+	// and effects should be idempotent
+	for _, call := range c.calls {
+		log.Println("resending inflight method", call.ServiceMethod)
+		c.Send(NewMethod(call.ID, call.ServiceMethod, call.Args.([]interface{})))
+	}
+
+	// Resend subscriptions and patch up collections
+	for _, sub := range c.subs {
+		log.Println("restarting active subscription", sub.ServiceMethod)
+		c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{})))
+	}
+	// Patching up the collections right now is just resetting them. There
+	// must be a better way but this is quick and works.
+	c.Collections = map[string]Collection{}
 }
 
 // Subscribe subscribes to data updates.
@@ -181,12 +198,11 @@ func (c *Client) Subscribe(subName string, args []interface{}, done chan *Call) 
 		}
 	}
 	call.Done = done
-	c.calls[call.ID] = call
+	c.subs[call.ID] = call
 
 	// Save this subscription to the client so we can reconnect
 	subArgs := make([]interface{}, len(args))
 	copy(subArgs, args)
-	c.subs[subName] = subArgs
 
 	c.Send(NewSub(call.ID, subName, args))
 
@@ -372,7 +388,6 @@ func (c *Client) inboxManager() {
 					c.session = msg["session"].(string)
 					// Start automatic heartbeats
 					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
-						log.Println("PT ping")
 						c.Ping()
 						c.pingTimer.Reset(c.HeartbeatInterval)
 					})
@@ -410,12 +425,17 @@ func (c *Client) inboxManager() {
 				// Live Data
 				case "nosub":
 					log.Println("Subscription returned a nosub error", msg)
-					// TODO clear related subscriptions
+					// Clear related subscriptions=
+					sub, ok := msg["id"]
+					if ok {
+						delete(c.subs, sub.(string))
+					}
 				case "ready":
+					// Run 'done' callbacks on all ready subscriptions
 					subs, ok := msg["subs"]
 					if ok {
 						for _, sub := range subs.([]interface{}) {
-							call, ok := c.calls[sub.(string)]
+							call, ok := c.subs[sub.(string)]
 							if ok {
 								call.done()
 							}
@@ -437,6 +457,7 @@ func (c *Client) inboxManager() {
 					id, ok := msg["id"]
 					if ok {
 						call := c.calls[id.(string)]
+						delete(c.calls, id.(string))
 						e, ok := msg["error"]
 						if ok {
 							call.Error = fmt.Errorf(e.(string))
