@@ -3,7 +3,7 @@ package ddp_test
 import (
 	"encoding/json"
 
-	. "github.com/badslug/ddp"
+	. "github.com/gopackage/ddp"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
