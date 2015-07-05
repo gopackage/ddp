@@ -19,8 +19,6 @@ type Client struct {
 	HeartbeatTimeout time.Duration
 	// ReconnectInterval is the time between reconnections on bad connections
 	ReconnectInterval time.Duration
-	// Collections contains all the collections currently subscribed
-	Collections map[string]Collection
 
 	// writeStats controls statistics gathering for current websocket writes.
 	writeSocketStats *WriterStats
@@ -67,6 +65,8 @@ type Client struct {
 	calls map[string]*Call
 	// subs tracks active subscriptions. Map contains name->args
 	subs map[string]*Call
+	// collections contains all the collections currently subscribed
+	collections map[string]Collection
 
 	// idManager tracks IDs for ddp messages
 	idManager
@@ -91,7 +91,7 @@ func NewClient(url, origin string) (*Client, error) {
 		HeartbeatInterval: 45 * time.Second, // Meteor impl default + 10 (we ping last)
 		HeartbeatTimeout:  15 * time.Second, // Meteor impl default
 		ReconnectInterval: 5 * time.Second,
-		Collections:       map[string]Collection{},
+		collections:       map[string]Collection{},
 		ws:                ws,
 		url:               url,
 		origin:            origin,
@@ -176,7 +176,7 @@ func (c *Client) Reconnect() {
 	}
 	// Patching up the collections right now is just resetting them. There
 	// must be a better way but this is quick and works.
-	c.Collections = map[string]Collection{}
+	c.collections = map[string]Collection{}
 }
 
 // Subscribe subscribes to data updates.
@@ -289,6 +289,7 @@ func (c *Client) PingPong(id string, timeout time.Duration, handler func(error))
 // Send transmits messages to the server. The msg parameter must be json
 // encoder compatible.
 func (c *Client) Send(msg interface{}) error {
+	log.Println("send", msg)
 	return c.encoder.Encode(msg)
 }
 
@@ -336,6 +337,16 @@ func (c *Client) SetSocketLogActive(active bool) {
 	c.readLog.Active = active
 }
 
+// CollectionByName retrieves a collection by it's name.
+func (c *Client) CollectionByName(name string) Collection {
+	collection, ok := c.collections[name]
+	if !ok {
+		collection = NewCollection(name)
+		c.collections[name] = collection
+	}
+	return collection
+}
+
 // ClientStats displays combined statistics for the Client.
 type ClientStats struct {
 	// Reads provides statistics on the raw i/o network reads for the current connection.
@@ -377,6 +388,7 @@ func (c *Client) inboxManager() {
 	for {
 		select {
 		case msg := <-c.inbox:
+			log.Println("inbox", msg)
 			// Message!
 			mtype, ok := msg["msg"]
 			if ok {
@@ -500,19 +512,12 @@ func (c *Client) collectionBy(msg map[string]interface{}) Collection {
 	if !ok {
 		return NewMockCollection()
 	}
-	var collection Collection
 	switch name := n.(type) {
 	case string:
-		collection, ok = c.Collections[name]
-		if !ok {
-			collection = NewCollection(name)
-			c.Collections[name] = collection
-		}
+		return c.CollectionByName(name)
 	default:
 		return NewMockCollection()
 	}
-
-	return collection
 }
 
 // inboxWorker pulls messages from a websocket, decodes JSON packets, and

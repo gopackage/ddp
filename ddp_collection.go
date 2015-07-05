@@ -1,6 +1,9 @@
 package ddp
 
-import "fmt"
+import (
+	"fmt"
+	"log"
+)
 
 // ----------------------------------------------------------------------
 // EJSON document interface
@@ -130,6 +133,8 @@ type Collection interface {
 	// FindAll returns a map of all items in the cache - this is a hack
 	// until we have time to build out a real minimongo interface.
 	FindAll() map[string]interface{}
+	// AddUpdateListener adds a channel that receives update messages.
+	AddUpdateListener(chan<- map[string]interface{})
 
 	// livedata updates
 
@@ -147,7 +152,7 @@ func NewMockCollection() Collection {
 
 // NewCollection creates a new collection - always KeyCache.
 func NewCollection(name string) Collection {
-	return &KeyCache{name, map[string]interface{}{}}
+	return &KeyCache{name, map[string]interface{}{}, nil}
 }
 
 // KeyCache caches items keyed on unique ID.
@@ -156,14 +161,25 @@ type KeyCache struct {
 	Name string
 	// items contains collection items by ID
 	items map[string]interface{}
+	// listeners contains all the listeners that should be notified of collection updates.
+	listeners []chan<- map[string]interface{}
+	// TODO(badslug): do we need to protect from multiple threads
 }
 
 func (c *KeyCache) added(msg map[string]interface{}) {
+	log.Println("added", msg)
 	id := idForMessage(msg)
 	c.items[id] = msg["fields"]
+	// TODO(badslug): change notification should include change type
+	for _, listener := range c.listeners {
+		log.Println("notifying listener", listener)
+		listener <- msg
+	}
+	log.Println("added done")
 }
 
 func (c *KeyCache) changed(msg map[string]interface{}) {
+	log.Println("changed", msg)
 	id := idForMessage(msg)
 	item, ok := c.items[id]
 	if ok {
@@ -187,6 +203,11 @@ func (c *KeyCache) changed(msg map[string]interface{}) {
 	} else {
 		c.items[id] = msg["fields"]
 	}
+	for _, listener := range c.listeners {
+		log.Println("notifying listener", listener)
+		listener <- msg
+	}
+	log.Println("changed done")
 }
 
 func (c *KeyCache) removed(msg map[string]interface{}) {
@@ -210,6 +231,11 @@ func (c *KeyCache) FindOne(id string) interface{} {
 // FindAll returns a dump of all items in the collection
 func (c *KeyCache) FindAll() map[string]interface{} {
 	return c.items
+}
+
+// AddUpdateListener adds a listener for changes on a collection.
+func (c *KeyCache) AddUpdateListener(ch chan<- map[string]interface{}) {
+	c.listeners = append(c.listeners, ch)
 }
 
 // OrderedCache caches items based on list order.
@@ -250,6 +276,10 @@ func (c *OrderedCache) FindAll() map[string]interface{} {
 	return map[string]interface{}{}
 }
 
+// AddUpdateListener does nothing.
+func (c *OrderedCache) AddUpdateListener(ch chan<- map[string]interface{}) {
+}
+
 // MockCache implements the Collection interface but does nothing with the data.
 type MockCache struct {
 }
@@ -282,6 +312,10 @@ func (c *MockCache) FindOne(id string) interface{} {
 // FindAll returns a dump of all items in the collection
 func (c *MockCache) FindAll() map[string]interface{} {
 	return map[string]interface{}{}
+}
+
+// AddUpdateListener does nothing.
+func (c *MockCache) AddUpdateListener(ch chan<- map[string]interface{}) {
 }
 
 func idForMessage(msg map[string]interface{}) string {
