@@ -13,29 +13,15 @@ var _ = Describe("Core", func() {
 
 	Describe("Doc", func() {
 
-		It("should split paths", func() {
-			var data interface{}
-			err := json.Unmarshal([]byte(`{"foo":"bar"}`), &data)
-			Ω(err).ShouldNot(HaveOccurred())
-			doc := NewDoc(data)
-			dir, key, err := doc.Split([]string{"foo"})
-			Ω(err).ShouldNot(HaveOccurred())
-			Ω(dir).Should(Equal([]string{}))
-			Ω(key).Should(Equal("foo"))
-			_, _, err = doc.Split([]string{})
-			Ω(err).Should(HaveOccurred())
-		})
-
 		It("should navigate a 1 deep path", func() {
 			var data interface{}
 			err := json.Unmarshal([]byte(`{"foo":"bar"}`), &data)
 			Ω(err).ShouldNot(HaveOccurred())
 			doc := NewDoc(data)
-			item, err := doc.ItemForPath([]string{"foo"})
-			Ω(err).ShouldNot(HaveOccurred())
+			item := doc.Item("foo")
 			Ω(item).ShouldNot(BeNil())
-			value, err := doc.GetStringForPath([]string{"foo"})
-			Ω(err).ShouldNot(HaveOccurred())
+			value := doc.String("foo")
+			Ω(value).ShouldNot(BeNil())
 			Ω(value).Should(Equal("bar"))
 		})
 
@@ -44,12 +30,25 @@ var _ = Describe("Core", func() {
 			err := json.Unmarshal([]byte(`{"hello":{"foo":"bar"}}`), &data)
 			Ω(err).ShouldNot(HaveOccurred())
 			doc := NewDoc(data)
-			item, err := doc.ItemForPath([]string{"hello", "foo"})
-			Ω(err).ShouldNot(HaveOccurred())
+			item := doc.Item("hello.foo")
 			Ω(item).ShouldNot(BeNil())
-			value, err := doc.GetStringForPath([]string{"hello", "foo"})
-			Ω(err).ShouldNot(HaveOccurred())
+			value := doc.String("hello.foo")
+			Ω(value).ShouldNot(BeNil())
 			Ω(value).Should(Equal("bar"))
+		})
+
+		It("should set a 2 deep path", func() {
+			var data interface{}
+			err := json.Unmarshal([]byte(`{}`), &data)
+			Ω(err).ShouldNot(HaveOccurred())
+			doc := NewDoc(data)
+			doc.Set("hello.foo", "bar")
+			value := doc.String("hello.foo")
+			Ω(value).ShouldNot(BeNil())
+			Ω(value).Should(Equal("bar"))
+			txt, err := json.Marshal(data)
+			Ω(err).ShouldNot(HaveOccurred())
+			Ω(string(txt)).Should(Equal(`{"hello":{"foo":"bar"}}`))
 		})
 	})
 })

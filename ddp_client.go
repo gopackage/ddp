@@ -165,13 +165,11 @@ func (c *Client) Reconnect() {
 	// Send calls that haven't been confirmed - may not have been sent
 	// and effects should be idempotent
 	for _, call := range c.calls {
-		log.Println("resending inflight method", call.ServiceMethod)
 		c.Send(NewMethod(call.ID, call.ServiceMethod, call.Args.([]interface{})))
 	}
 
 	// Resend subscriptions and patch up collections
 	for _, sub := range c.subs {
-		log.Println("restarting active subscription", sub.ServiceMethod)
 		c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{})))
 	}
 	// Patching up the collections right now is just resetting them. There
@@ -180,12 +178,17 @@ func (c *Client) Reconnect() {
 }
 
 // Subscribe subscribes to data updates.
-func (c *Client) Subscribe(subName string, args []interface{}, done chan *Call) *Call {
+func (c *Client) Subscribe(subName string, done chan *Call, args ...interface{}) *Call {
+
+	if args == nil {
+		args = []interface{}{}
+	}
 	call := new(Call)
 	call.ID = c.newID()
 	call.ServiceMethod = subName
 	call.Args = args
 	call.Owner = c
+
 	if done == nil {
 		done = make(chan *Call, 10) // buffered.
 	} else {
@@ -210,8 +213,8 @@ func (c *Client) Subscribe(subName string, args []interface{}, done chan *Call) 
 }
 
 // Sub sends a synchronous subscription request to the server.
-func (c *Client) Sub(subName string, args []interface{}) error {
-	call := <-c.Subscribe(subName, args, make(chan *Call, 1)).Done
+func (c *Client) Sub(subName string, args ...interface{}) error {
+	call := <-c.Subscribe(subName, make(chan *Call, 1), args...).Done
 	return call.Error
 }
 
@@ -221,8 +224,11 @@ func (c *Client) Sub(subName string, args []interface{}) error {
 // If non-nil, done must be buffered or Go will deliberately crash.
 //
 // Go and Call are modeled after the standard `net/rpc` package versions.
-func (c *Client) Go(serviceMethod string, args []interface{}, done chan *Call) *Call {
+func (c *Client) Go(serviceMethod string, done chan *Call, args ...interface{}) *Call {
 
+	if args == nil {
+		args = []interface{}{}
+	}
 	call := new(Call)
 	call.ID = c.newID()
 	call.ServiceMethod = serviceMethod
@@ -248,8 +254,8 @@ func (c *Client) Go(serviceMethod string, args []interface{}, done chan *Call) *
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
-func (c *Client) Call(serviceMethod string, args []interface{}) (interface{}, error) {
-	call := <-c.Go(serviceMethod, args, make(chan *Call, 1)).Done
+func (c *Client) Call(serviceMethod string, args ...interface{}) (interface{}, error) {
+	call := <-c.Go(serviceMethod, make(chan *Call, 1), args...).Done
 	return call.Reply, call.Error
 }
 
@@ -289,7 +295,6 @@ func (c *Client) PingPong(id string, timeout time.Duration, handler func(error))
 // Send transmits messages to the server. The msg parameter must be json
 // encoder compatible.
 func (c *Client) Send(msg interface{}) error {
-	log.Println("send", msg)
 	return c.encoder.Encode(msg)
 }
 
@@ -347,24 +352,6 @@ func (c *Client) CollectionByName(name string) Collection {
 	return collection
 }
 
-// ClientStats displays combined statistics for the Client.
-type ClientStats struct {
-	// Reads provides statistics on the raw i/o network reads for the current connection.
-	Reads *Stats
-	// Reads provides statistics on the raw i/o network reads for the all client connections.
-	TotalReads *Stats
-	// Writes provides statistics on the raw i/o network writes for the current connection.
-	Writes *Stats
-	// Writes provides statistics on the raw i/o network writes for all the client connections.
-	TotalWrites *Stats
-	// Reconnects is the number of reconnections the client has made.
-	Reconnects int64
-	// PingsSent is the number of pings sent by the client
-	PingsSent int64
-	// PingsRecv is the number of pings received by the client
-	PingsRecv int64
-}
-
 // start starts a new client connection on the provided websocket
 func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 
@@ -388,7 +375,6 @@ func (c *Client) inboxManager() {
 	for {
 		select {
 		case msg := <-c.inbox:
-			log.Println("inbox", msg)
 			// Message!
 			mtype, ok := msg["msg"]
 			if ok {
@@ -472,7 +458,8 @@ func (c *Client) inboxManager() {
 						delete(c.calls, id.(string))
 						e, ok := msg["error"]
 						if ok {
-							call.Error = fmt.Errorf(e.(string))
+							txt, _ := json.Marshal(e)
+							call.Error = fmt.Errorf(string(txt))
 						} else {
 							call.Reply = msg["result"]
 						}

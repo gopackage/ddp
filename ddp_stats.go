@@ -2,6 +2,7 @@ package ddp
 
 import (
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -170,6 +171,41 @@ type Stats struct {
 	Errors int64
 	// Runtime is the duration that stats have been gathered.
 	Runtime time.Duration
+}
+
+// ClientStats displays combined statistics for the Client.
+type ClientStats struct {
+	// Reads provides statistics on the raw i/o network reads for the current connection.
+	Reads *Stats
+	// Reads provides statistics on the raw i/o network reads for the all client connections.
+	TotalReads *Stats
+	// Writes provides statistics on the raw i/o network writes for the current connection.
+	Writes *Stats
+	// Writes provides statistics on the raw i/o network writes for all the client connections.
+	TotalWrites *Stats
+	// Reconnects is the number of reconnections the client has made.
+	Reconnects int64
+	// PingsSent is the number of pings sent by the client
+	PingsSent int64
+	// PingsRecv is the number of pings received by the client
+	PingsRecv int64
+}
+
+func (stats *ClientStats) String() {
+	i := stats.Reads
+	ti := stats.TotalReads
+	o := stats.Writes
+	to := stats.TotalWrites
+	fmt.Sprintf("bytes: %d/%d##%d/%d ops: %d/%d##%d/%d err: %d/%d##%d/%d reconnects: %d pings: %d/%d uptime: %v##%v",
+		i.Bytes, o.Bytes,
+		ti.Bytes, to.Bytes,
+		i.Ops, o.Ops,
+		ti.Ops, to.Ops,
+		i.Errors, o.Errors,
+		ti.Errors, to.Errors,
+		stats.Reconnects,
+		stats.PingsRecv, stats.PingsSent,
+		i.Runtime, ti.Runtime)
 }
 
 // StatsTracker provides the basic tooling for tracking i/o stats.
