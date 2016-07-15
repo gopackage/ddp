@@ -150,6 +150,14 @@ func NewUsernameLogin(user, pass string) *Login {
 	return &Login{User: &User{Username: user}, Password: NewPassword(pass)}
 }
 
+type LoginResume struct {
+	Token string `json:"resume"`
+}
+
+func NewLoginresume(token string) *LoginResume {
+	return &LoginResume{Token:token}
+}
+
 type User struct {
 	Email    string `json:"email,omitempty"`
 	Username string `json:"username,omitempty"`
