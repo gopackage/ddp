@@ -54,6 +54,31 @@ func (d *Doc) Array(path string) []interface{} {
 	return nil
 }
 
+// StringArray locates an []string - json array of strings - at a path
+// or returns nil if not found. The string array will contain all string values
+// in the array and skip any non-string entries.
+func (d *Doc) StringArray(path string) []string {
+	item := d.Item(path)
+	if item != nil {
+		switch m := item.(type) {
+		case []interface{}:
+			items := []string{}
+			for _, item := range m {
+				switch val := item.(type) {
+				case string:
+					items = append(items, val)
+				}
+			}
+			return items
+		case []string:
+			return m
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 // String returns a string value located at the path or an empty string if not found.
 func (d *Doc) String(path string) string {
 	item := d.Item(path)
@@ -102,6 +127,8 @@ func (d *Doc) Item(path string) interface{} {
 		// This is an intermediate step - we must be in a map
 		switch m := item.(type) {
 		case map[string]interface{}:
+			item = m[step]
+		case Update:
 			item = m[step]
 		default:
 			return nil
@@ -154,8 +181,8 @@ type LoginResume struct {
 	Token string `json:"resume"`
 }
 
-func NewLoginresume(token string) *LoginResume {
-	return &LoginResume{Token:token}
+func NewLoginResume(token string) *LoginResume {
+	return &LoginResume{Token: token}
 }
 
 type User struct {

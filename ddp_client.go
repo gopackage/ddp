@@ -10,6 +10,29 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+const (
+	DISCONNECTED = iota
+	DIALING
+	CONNECTING
+	CONNECTED
+)
+
+type ConnectionListener interface {
+	Connected()
+}
+
+type ConnectionNotifier interface {
+	AddConnectionListener(listener ConnectionListener)
+}
+
+type StatusListener interface {
+	Status(status int)
+}
+
+type StatusNotifier interface {
+	AddStatusListener(listener StatusListener)
+}
+
 // Client represents a DDP client connection. The DDP client establish a DDP
 // session and acts as a message pump for other tools.
 type Client struct {
@@ -68,6 +91,11 @@ type Client struct {
 	// collections contains all the collections currently subscribed
 	collections map[string]Collection
 
+	// statusListeners will be informed when the connection status of the client changes
+	statusListeners []StatusListener
+	// connectionListeners will be informed when a connection to the server is established
+	connectionListeners []ConnectionListener
+
 	// idManager tracks IDs for ddp messages
 	idManager
 }
@@ -82,17 +110,12 @@ type Client struct {
 // TBD create an option to substitute heartbeat and reconnect behavior (aka http.Tranport)
 // TBD create an option to hijack the connection (aka http.Hijacker)
 // TBD create profiling features (aka net/http/pprof)
-func NewClient(url, origin string) (*Client, error) {
-	ws, err := websocket.Dial(url, "", origin)
-	if err != nil {
-		return nil, err
-	}
+func NewClient(url, origin string) *Client {
 	c := &Client{
-		HeartbeatInterval: 45 * time.Second, // Meteor impl default + 10 (we ping last)
+		HeartbeatInterval: time.Minute,      // Meteor impl default + 10 (we ping last)
 		HeartbeatTimeout:  15 * time.Second, // Meteor impl default
 		ReconnectInterval: 5 * time.Second,
 		collections:       map[string]Collection{},
-		ws:                ws,
 		url:               url,
 		origin:            origin,
 		inbox:             make(chan map[string]interface{}, 100),
@@ -119,10 +142,7 @@ func NewClient(url, origin string) (*Client, error) {
 	// We spin off an inbox processing goroutine
 	go c.inboxManager()
 
-	// Start DDP connection
-	c.start(ws, NewConnect())
-
-	return c, nil
+	return c
 }
 
 // Session returns the negotiated session token for the connection.
@@ -133,6 +153,39 @@ func (c *Client) Session() string {
 // Version returns the negotiated protocol version in use by the client.
 func (c *Client) Version() string {
 	return c.version
+}
+
+// AddStatusListener in order to receive status change updates.
+func (c *Client) AddStatusListener(listener StatusListener) {
+	c.statusListeners = append(c.statusListeners, listener)
+}
+
+// AddConnectionListener in order to receive connection updates.
+func (c *Client) AddConnectionListener(listener ConnectionListener) {
+	c.connectionListeners = append(c.connectionListeners, listener)
+}
+
+// status updates all status listeners with the new client status.
+func (c *Client) status(status int) {
+	for _, listener := range c.statusListeners {
+		listener.Status(status)
+	}
+}
+
+// Connect attempts to connect the client to the server.
+func (c *Client) Connect() error {
+	c.status(DIALING)
+	ws, err := websocket.Dial(c.url, "", c.origin)
+	if err != nil {
+		c.Close()
+		log.Println("Dial error", err)
+		// Reconnect again after set interval
+		time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+		return err
+	}
+	// Start DDP connection
+	c.start(ws, NewConnect())
+	return nil
 }
 
 // Reconnect attempts to reconnect the client to the server on the existing
@@ -147,8 +200,10 @@ func (c *Client) Reconnect() {
 	c.reconnects++
 
 	// Reconnect
+	c.status(DIALING)
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
+		c.Close()
 		log.Println("Dial error", err)
 		// Reconnect again after set interval
 		time.AfterFunc(c.ReconnectInterval, c.Reconnect)
@@ -172,9 +227,6 @@ func (c *Client) Reconnect() {
 	for _, sub := range c.subs {
 		c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{})))
 	}
-	// Patching up the collections right now is just resetting them. There
-	// must be a better way but this is quick and works.
-	c.collections = map[string]Collection{}
 }
 
 // Subscribe subscribes to data updates.
@@ -301,10 +353,19 @@ func (c *Client) Send(msg interface{}) error {
 // Close implements the io.Closer interface.
 func (c *Client) Close() {
 	// Shutdown out all outstanding pings
-	c.pingTimer.Stop()
+	if c.pingTimer != nil {
+		c.pingTimer.Stop()
+	}
+
 	// Close websocket
-	c.ws.Close()
-	c.ws = nil
+	if c.ws != nil {
+		c.ws.Close()
+		c.ws = nil
+	}
+	for _, collection := range c.collections {
+		collection.reset()
+	}
+	c.status(DISCONNECTED)
 }
 
 // ResetStats resets the statistics for the client.
@@ -352,8 +413,19 @@ func (c *Client) CollectionByName(name string) Collection {
 	return collection
 }
 
+// CollectionStats returns a snapshot of statistics for the currently known collections.
+func (c *Client) CollectionStats() []CollectionStats {
+	stats := make([]CollectionStats, 0, len(c.collections))
+	for name, collection := range c.collections {
+		stats = append(stats, CollectionStats{Name: name, Count: len(collection.FindAll())})
+	}
+	return stats
+}
+
 // start starts a new client connection on the provided websocket
 func (c *Client) start(ws *websocket.Conn, connect *Connect) {
+
+	c.status(CONNECTING)
 
 	c.ws = ws
 	c.writeLog.SetWriter(ws)
@@ -376,12 +448,16 @@ func (c *Client) inboxManager() {
 		select {
 		case msg := <-c.inbox:
 			// Message!
+			//log.Println("Got message", msg)
 			mtype, ok := msg["msg"]
 			if ok {
 				switch mtype.(string) {
-
 				// Connection management
 				case "connected":
+					c.status(CONNECTED)
+					for _, collection := range c.collections {
+						collection.init()
+					}
 					c.version = "1" // Currently the only version we support
 					c.session = msg["session"].(string)
 					// Start automatic heartbeats
@@ -389,6 +465,10 @@ func (c *Client) inboxManager() {
 						c.Ping()
 						c.pingTimer.Reset(c.HeartbeatInterval)
 					})
+					// Notify connection listeners
+					for _, listener := range c.connectionListeners {
+						go listener.Connected()
+					}
 				case "failed":
 					log.Fatalf("IM Failed to connect, we support version 1 but server supports %s", msg["version"])
 

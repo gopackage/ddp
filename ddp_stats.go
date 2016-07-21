@@ -154,10 +154,13 @@ func NewWriterLogger(writer io.Writer, logger *log.Logger, active bool, dataType
 	return &WriterLogger{WriterProxy: *NewWriterProxy(writer), Logger: NewLogger(logger, active, dataType, truncate)}
 }
 
-// Write logs the written bytes and passes them to the wrapped reader.
+// Write logs the written bytes and passes them to the wrapped writer.
 func (w *WriterLogger) Write(p []byte) (int, error) {
-	n, err := w.writer.Write(p)
-	return w.Log(p, n, err)
+	if w.writer != nil {
+		n, err := w.writer.Write(p)
+		return w.Log(p, n, err)
+	}
+	return 0, nil
 }
 
 // Stats tracks statistics for i/o operations. Stats are produced from a
@@ -191,12 +194,15 @@ type ClientStats struct {
 	PingsRecv int64
 }
 
-func (stats *ClientStats) String() {
+// String produces a compact string representation of the client stats.
+func (stats *ClientStats) String() string {
 	i := stats.Reads
 	ti := stats.TotalReads
 	o := stats.Writes
 	to := stats.TotalWrites
-	fmt.Sprintf("bytes: %d/%d##%d/%d ops: %d/%d##%d/%d err: %d/%d##%d/%d reconnects: %d pings: %d/%d uptime: %v##%v",
+	totalRun := (ti.Runtime * 1000000) / 1000000
+	run := (i.Runtime * 1000000) / 1000000
+	return fmt.Sprintf("bytes: %d/%d##%d/%d ops: %d/%d##%d/%d err: %d/%d##%d/%d reconnects: %d pings: %d/%d uptime: %v##%v",
 		i.Bytes, o.Bytes,
 		ti.Bytes, to.Bytes,
 		i.Ops, o.Ops,
@@ -205,7 +211,18 @@ func (stats *ClientStats) String() {
 		ti.Errors, to.Errors,
 		stats.Reconnects,
 		stats.PingsRecv, stats.PingsSent,
-		i.Runtime, ti.Runtime)
+		run, totalRun)
+}
+
+// CollectionStats combines statistics about a collection.
+type CollectionStats struct {
+	Name  string // Name of the collection
+	Count int    // Count is the total number of documents in the collection
+}
+
+// String produces a compact string representation of the collection stat.
+func (s *CollectionStats) String() string {
+	return fmt.Sprintf("%s[%d]", s.Name, s.Count)
 }
 
 // StatsTracker provides the basic tooling for tracking i/o stats.
@@ -297,5 +314,8 @@ func NewWriterStats(writer io.Writer) *WriterStats {
 
 // Write passes through a write collecting statistics.
 func (w *WriterStats) Write(p []byte) (int, error) {
-	return w.Op(w.writer.Write(p))
+	if w.writer != nil {
+		return w.Op(w.writer.Write(p))
+	}
+	return 0, nil
 }
