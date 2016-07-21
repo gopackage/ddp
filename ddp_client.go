@@ -540,6 +540,7 @@ func (c *Client) inboxManager() {
 						if ok {
 							txt, _ := json.Marshal(e)
 							call.Error = fmt.Errorf(string(txt))
+							call.Reply = e
 						} else {
 							call.Reply = msg["result"]
 						}
