@@ -93,6 +93,20 @@ func (d *Doc) String(path string) string {
 	return ""
 }
 
+// Bool returns a boolean value located at the path or false if not found.
+func (d *Doc) Bool(path string) bool {
+	item := d.Item(path)
+	if item != nil {
+		switch m := item.(type) {
+		case bool:
+			return m
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 // Float returns a float64 value located at the path or zero if not found.
 func (d *Doc) Float(path string) float64 {
 	item := d.Item(path)
