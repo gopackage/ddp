@@ -9,13 +9,10 @@ import (
 )
 
 func main() {
-	client, err := ddp.NewClient("ws://localhost:3000/websocket", "http://localhost/")
-	if err != nil {
-		log.Fatalln(err)
-	}
+	client := ddp.NewClient("ws://localhost:3000/websocket", "http://localhost/")
 	defer client.Close()
 
-	err = client.Sub("builds", []interface{}{"abc"})
+	err := client.Sub("builds", []interface{}{"abc"})
 	if err != nil {
 		log.Fatalln(err)
 	}

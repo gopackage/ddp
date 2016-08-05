@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -90,6 +91,12 @@ type Client struct {
 	subs map[string]*Call
 	// collections contains all the collections currently subscribed
 	collections map[string]Collection
+	// connectionStatus is the current connection status of the client
+	connectionStatus int
+	// reconnectTimer is the timer tracking reconnections
+	reconnectTimer *time.Timer
+	// reconnectLock protects access to reconnection
+	reconnectLock *sync.Mutex
 
 	// statusListeners will be informed when the connection status of the client changes
 	statusListeners []StatusListener
@@ -123,6 +130,8 @@ func NewClient(url, origin string) *Client {
 		pings:             map[string][]*pingTracker{},
 		calls:             map[string]*Call{},
 		subs:              map[string]*Call{},
+		connectionStatus:  DISCONNECTED,
+		reconnectLock:     &sync.Mutex{},
 
 		// Stats
 		writeSocketStats: NewWriterStats(nil),
@@ -167,6 +176,10 @@ func (c *Client) AddConnectionListener(listener ConnectionListener) {
 
 // status updates all status listeners with the new client status.
 func (c *Client) status(status int) {
+	if c.connectionStatus == status {
+		return
+	}
+	c.connectionStatus = status
 	for _, listener := range c.statusListeners {
 		listener.Status(status)
 	}
@@ -179,8 +192,7 @@ func (c *Client) Connect() error {
 	if err != nil {
 		c.Close()
 		log.Println("Dial error", err)
-		// Reconnect again after set interval
-		time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+		c.reconnectLater()
 		return err
 	}
 	// Start DDP connection
@@ -194,6 +206,14 @@ func (c *Client) Connect() error {
 // TODO needs a reconnect backoff so we don't trash a down server
 // TODO reconnect should not allow more reconnects while a reconnection is already in progress.
 func (c *Client) Reconnect() {
+	func() {
+		c.reconnectLock.Lock()
+		defer c.reconnectLock.Unlock()
+		if c.reconnectTimer != nil {
+			c.reconnectTimer.Stop()
+			c.reconnectTimer = nil
+		}
+	}()
 
 	c.Close()
 
@@ -205,8 +225,7 @@ func (c *Client) Reconnect() {
 	if err != nil {
 		c.Close()
 		log.Println("Dial error", err)
-		// Reconnect again after set interval
-		time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+		c.reconnectLater()
 		return
 	}
 
@@ -318,7 +337,7 @@ func (c *Client) Ping() {
 	c.PingPong(c.newID(), c.HeartbeatTimeout, func(err error) {
 		if err != nil {
 			// Is there anything else we should or can do?
-			go c.Reconnect()
+			c.reconnectLater()
 		}
 	})
 }
@@ -355,6 +374,7 @@ func (c *Client) Close() {
 	// Shutdown out all outstanding pings
 	if c.pingTimer != nil {
 		c.pingTimer.Stop()
+		c.pingTimer = nil
 	}
 
 	// Close websocket
@@ -611,8 +631,16 @@ func (c *Client) inboxWorker(ws io.Reader) {
 		}
 	}
 
-	// Spawn a reconnect
-	time.AfterFunc(3*time.Second, func() {
-		c.Reconnect()
-	})
+	c.reconnectLater()
+}
+
+// reconnectLater schedules a reconnect for later. We need to make sure that we don't
+// block, and that we don't reconnect more frequently than once every c.ReconnectInterval
+func (c *Client) reconnectLater() {
+	c.Close()
+	c.reconnectLock.Lock()
+	defer c.reconnectLock.Unlock()
+	if c.reconnectTimer == nil {
+		c.reconnectTimer = time.AfterFunc(c.ReconnectInterval, c.Reconnect)
+	}
 }
