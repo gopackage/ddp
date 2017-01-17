@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/net/websocket"
+	"errors"
 )
 
 const (
@@ -523,10 +524,17 @@ func (c *Client) inboxManager() {
 				// Live Data
 				case "nosub":
 					log.Println("Subscription returned a nosub error", msg)
-					// Clear related subscriptions=
+					// Clear related subscriptions
 					sub, ok := msg["id"]
 					if ok {
-						delete(c.subs, sub.(string))
+						id := sub.(string)
+						runningSub := c.subs[id]
+
+						if runningSub != nil {
+							runningSub.Error = errors.New("Subscription returned a nosub error")
+							runningSub.done()
+							delete(c.subs, id)
+						}
 					}
 				case "ready":
 					// Run 'done' callbacks on all ready subscriptions
