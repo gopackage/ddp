@@ -45,11 +45,11 @@ type Client struct {
 	// ReconnectInterval is the time between reconnections on bad connections
 	ReconnectInterval time.Duration
 
-	// writeStats controls statistics gathering for current websocket writes.
+	// writeSocketStats controls statistics gathering for current websocket writes.
 	writeSocketStats *WriterStats
 	// writeStats controls statistics gathering for overall client writes.
 	writeStats *WriterStats
-	// readStats controls statistics gathering for current websocket reads.
+	// readSocketStats controls statistics gathering for current websocket reads.
 	readSocketStats *ReaderStats
 	// readStats controls statistics gathering for overall client reads.
 	readStats *ReaderStats
@@ -187,6 +187,7 @@ func (c *Client) Connect() error {
 		c.reconnectLater()
 		return err
 	}
+	log.Debug("dialed")
 	// Start DDP connection
 	c.start(ws, NewConnect())
 	return nil
@@ -430,7 +431,9 @@ func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 
 	c.ws = ws
 	c.writeSocketStats = NewWriterStats(c.ws)
+	c.writeStats.Writer = c.writeSocketStats
 	c.readSocketStats = NewReaderStats(c.ws)
+	c.readStats.Reader = c.readSocketStats
 
 	// We spin off an inbox stuffing goroutine
 	go c.inboxWorker(c.readStats)
@@ -448,6 +451,7 @@ func (c *Client) inboxManager() {
 			//log.Println("Got message", msg)
 			msgType, ok := msg["msg"]
 			if ok {
+				log.WithField("msg", msgType).Debug("recv")
 				switch msgType.(string) {
 				// Connection management
 				case "connected":

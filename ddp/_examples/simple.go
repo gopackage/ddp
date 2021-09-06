@@ -9,16 +9,26 @@ import (
 )
 
 func main() {
+
+	// Turn up logging
+	log.SetLevel(log.DebugLevel)
+
 	client := ddp.NewClient("ws://localhost:3000/websocket", "http://localhost/")
 	defer client.Close()
 
-	err := client.Sub("builds", []interface{}{"abc"})
+	err := client.Connect()
+	if err != nil {
+		log.WithError(err).Fatal("could not connect")
+	}
+	log.Debug("connected")
+
+	err = client.Sub("builds", []interface{}{"abc"})
 	if err != nil {
 		log.WithError(err).Fatal("could not subscribe")
 	}
 
 	// We know client.Sub is synchronous and will only respond after we connect.
-	log.WithFields(log.Fields{"version": client.Version(), "session": client.Session()}).Info("connected")
+	log.WithFields(log.Fields{"version": client.Version(), "session": client.Session()}).Info("ready")
 
 	builds := client.CollectionByName("builds")
 	log.WithField("count", len(builds.FindAll())).Info("Collection: builds")

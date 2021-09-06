@@ -76,12 +76,12 @@ type StatsTracker struct {
 	ops    int64
 	errors int64
 	start  time.Time
-	lock   *sync.Mutex
+	lock   sync.Mutex
 }
 
 // NewStatsTracker create a new tracker with start time set to now.
 func NewStatsTracker() *StatsTracker {
-	return &StatsTracker{start: time.Now(), lock: new(sync.Mutex)}
+	return &StatsTracker{start: time.Now()}
 }
 
 // Op records an i/o operation. The parameters are passed through to
@@ -103,7 +103,7 @@ func (t *StatsTracker) Op(n int, err error) (int, error) {
 	return n, err
 }
 
-// Snapshot takes a snapshot of the current reader statistics.
+// Snapshot takes a snapshot of the current Reader statistics.
 func (t *StatsTracker) Snapshot() *Stats {
 	t.lock.Lock()
 	defer t.lock.Unlock()
@@ -132,35 +132,39 @@ func (t *StatsTracker) snap() *Stats {
 // ReaderStats wraps a Reader and passes data to the actual data consumer.
 type ReaderStats struct {
 	StatsTracker
-	reader io.Reader
+	Reader io.Reader
 }
 
-// NewReaderStats creates a ReaderStats object for the provided reader.
+// NewReaderStats creates a ReaderStats object for the provided Reader.
 func NewReaderStats(reader io.Reader) *ReaderStats {
-	return &ReaderStats{reader: reader, StatsTracker: *NewStatsTracker()}
+	r := &ReaderStats{Reader: reader}
+	r.Reset()
+	return r
 }
 
 // Read passes through a read collecting statistics and logging activity.
 func (r *ReaderStats) Read(p []byte) (int, error) {
-	return r.Op(r.reader.Read(p))
+	return r.Op(r.Reader.Read(p))
 }
 
 // WriterStats tracks statistics on any io.Writer.
 // WriterStats wraps a Writer and passes data to the actual data producer.
 type WriterStats struct {
 	StatsTracker
-	writer io.Writer
+	Writer io.Writer
 }
 
-// NewWriterStats creates a WriterStats object for the provided writer.
+// NewWriterStats creates a WriterStats object for the provided Writer.
 func NewWriterStats(writer io.Writer) *WriterStats {
-	return &WriterStats{writer: writer, StatsTracker: *NewStatsTracker()}
+	w := &WriterStats{Writer: writer}
+	w.Reset()
+	return w
 }
 
-// Write collects writer statistics.
+// Write collects Writer statistics.
 func (w *WriterStats) Write(p []byte) (int, error) {
-	if w.writer != nil {
-		return w.Op(w.writer.Write(p))
+	if w.Writer != nil {
+		return w.Op(w.Writer.Write(p))
 	}
 	return 0, nil
 }
