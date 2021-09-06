@@ -1,39 +1,32 @@
-// Package ddp implements the MeteorJS DDP protocol over websockets. Fallback
-// to longpolling is NOT supported (and is not planned on ever being supported
-// by this library). We will try to model the library after `net/http` - right
-// now the library is barebones and doesn't provide the pluggability of http.
-// However, that's the goal for the package eventually.
 package ddp
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
+
+	"github.com/apex/log"
 )
 
-// debugLog is true if we should log debugging information about the connection
-var debugLog = true
-
-// The main file contains common utility types.
+// Contains common utility types.
 
 // -------------------------------------------------------------------
 
-// idManager provides simple incrementing IDs for ddp messages.
-type idManager struct {
+// KeyManager provides simple incrementing IDs for ddp messages.
+type KeyManager struct {
 	// nextID is the next ID for API calls
 	nextID uint64
 	// idMutex is a mutex to protect ID updates
 	idMutex *sync.Mutex
 }
 
-// newidManager creates a new instance and sets up resources.
-func newidManager() *idManager {
-	return &idManager{idMutex: new(sync.Mutex)}
+// NewKeyManager creates a new instance and sets up resources.
+func NewKeyManager() *KeyManager {
+	return &KeyManager{idMutex: new(sync.Mutex)}
 }
 
-// newID issues a new ID for use in calls.
-func (id *idManager) newID() string {
+// Next issues a new ID for use in calls.
+func (id *KeyManager) Next() string {
 	id.idMutex.Lock()
 	next := id.nextID
 	id.nextID++
@@ -43,8 +36,8 @@ func (id *idManager) newID() string {
 
 // -------------------------------------------------------------------
 
-// pingTracker tracks in-flight pings.
-type pingTracker struct {
+// PingTracker tracks in-flight pings.
+type PingTracker struct {
 	handler func(error)
 	timeout time.Duration
 	timer   *time.Timer
@@ -72,8 +65,13 @@ func (call *Call) done() {
 	default:
 		// We don't want to block here.  It is the caller's responsibility to make
 		// sure the channel has enough buffer space. See comment in Go().
-		if debugLog {
-			log.Println("rpc: discarding Call reply due to insufficient Done chan capacity")
-		}
+		log.Debug("rpc: discarding Call reply due to insufficient Done chan capacity")
+	}
+}
+
+// IgnoreErr logs an error if it occurs and ignores it.
+func IgnoreErr(err error, msg string) {
+	if err != nil {
+		log.WithError(err).Debug(msg)
 	}
 }

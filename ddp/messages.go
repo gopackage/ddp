@@ -1,9 +1,15 @@
 package ddp
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+)
+
 // ------------------------------------------------------------
 // DDP Messages
 //
-// Go structs representing DDP raw messages ready for JSON
+// Go structs representing common DDP raw messages ready for JSON
 // encoding.
 // ------------------------------------------------------------
 
@@ -79,4 +85,44 @@ func NewSub(id, subName string, args []interface{}) *Sub {
 		SubName: subName,
 		Args:    args,
 	}
+}
+
+
+// Login provides a Meteor.Accounts password login support
+type Login struct {
+	User     *User     `json:"user"`
+	Password *Password `json:"password"`
+}
+
+func NewEmailLogin(email, pass string) *Login {
+	return &Login{User: &User{Email: email}, Password: NewPassword(pass)}
+}
+
+func NewUsernameLogin(user, pass string) *Login {
+	return &Login{User: &User{Username: user}, Password: NewPassword(pass)}
+}
+
+type LoginResume struct {
+	Token string `json:"resume"`
+}
+
+func NewLoginResume(token string) *LoginResume {
+	return &LoginResume{Token: token}
+}
+
+type User struct {
+	Email    string `json:"email,omitempty"`
+	Username string `json:"username,omitempty"`
+}
+
+type Password struct {
+	Digest    string `json:"digest"`
+	Algorithm string `json:"algorithm"`
+}
+
+func NewPassword(pass string) *Password {
+	sha := sha256.New()
+	io.WriteString(sha, pass)
+	digest := sha.Sum(nil)
+	return &Password{Digest: hex.EncodeToString(digest), Algorithm: "sha-256"}
 }
