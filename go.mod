@@ -1,4 +1,4 @@
-module github.com/gopackage
+module github.com/gopackage/ddp
 
 go 1.17
 
