@@ -2,14 +2,14 @@ package ddp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"sync"
 	"time"
 
+	"github.com/apex/log"
 	"golang.org/x/net/websocket"
-	"errors"
 )
 
 const (
@@ -49,14 +49,10 @@ type Client struct {
 	writeSocketStats *WriterStats
 	// writeStats controls statistics gathering for overall client writes.
 	writeStats *WriterStats
-	// writeLog controls logging for client writes.
-	writeLog *WriterLogger
 	// readStats controls statistics gathering for current websocket reads.
 	readSocketStats *ReaderStats
 	// readStats controls statistics gathering for overall client reads.
 	readStats *ReaderStats
-	// readLog control logging for clietn reads.
-	readLog *ReaderLogger
 	// reconnects in the number of reconnections the client has made
 	reconnects int64
 	// pingsIn is the number of pings received from the server
@@ -74,7 +70,7 @@ type Client struct {
 	ws *websocket.Conn
 	// encoder is a JSON encoder to send outgoing packets to the websocket.
 	encoder *json.Encoder
-	// url the URL the websocket is connected to
+	// url the websocket is connected to
 	url string
 	// origin is the origin for the websocket connection
 	origin string
@@ -85,7 +81,7 @@ type Client struct {
 	// pingTimer is a timer for sending regular pings to the server
 	pingTimer *time.Timer
 	// pings tracks inflight pings based on each ping ID.
-	pings map[string][]*pingTracker
+	pings map[string][]*PingTracker
 	// calls tracks method invocations that are still in flight
 	calls map[string]*Call
 	// subs tracks active subscriptions. Map contains name->args
@@ -104,8 +100,8 @@ type Client struct {
 	// connectionListeners will be informed when a connection to the server is established
 	connectionListeners []ConnectionListener
 
-	// idManager tracks IDs for ddp messages
-	idManager
+	// KeyManager tracks IDs for ddp messages
+	KeyManager
 }
 
 // NewClient creates a default client (using an internal websocket) to the
@@ -115,7 +111,7 @@ type Client struct {
 // automatically and internally handle heartbeats and reconnects.
 //
 // TBD create an option to use an external websocket (aka htt.Transport)
-// TBD create an option to substitute heartbeat and reconnect behavior (aka http.Tranport)
+// TBD create an option to substitute heartbeat and reconnect behavior (aka http.Transport)
 // TBD create an option to hijack the connection (aka http.Hijacker)
 // TBD create profiling features (aka net/http/pprof)
 func NewClient(url, origin string) *Client {
@@ -128,7 +124,7 @@ func NewClient(url, origin string) *Client {
 		origin:            origin,
 		inbox:             make(chan map[string]interface{}, 100),
 		errors:            make(chan error, 100),
-		pings:             map[string][]*pingTracker{},
+		pings:             map[string][]*PingTracker{},
 		calls:             map[string]*Call{},
 		subs:              map[string]*Call{},
 		connectionStatus:  DISCONNECTED,
@@ -140,14 +136,9 @@ func NewClient(url, origin string) *Client {
 		readSocketStats:  NewReaderStats(nil),
 		readStats:        NewReaderStats(nil),
 
-		// Loggers
-		writeLog: NewWriterTextLogger(nil),
-		readLog:  NewReaderTextLogger(nil),
-
-		idManager: *newidManager(),
+		KeyManager: *NewKeyManager(),
 	}
 	c.encoder = json.NewEncoder(c.writeStats)
-	c.SetSocketLogActive(false)
 
 	// We spin off an inbox processing goroutine
 	go c.inboxManager()
@@ -192,7 +183,7 @@ func (c *Client) Connect() error {
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
 		c.Close()
-		log.Println("Dial error", err)
+		log.WithError(err).Debug("dial error")
 		c.reconnectLater()
 		return err
 	}
@@ -225,7 +216,7 @@ func (c *Client) Reconnect() {
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
 		c.Close()
-		log.Println("Dial error", err)
+		log.WithError(err).Debug("Dial error")
 		c.reconnectLater()
 		return
 	}
@@ -240,23 +231,23 @@ func (c *Client) Reconnect() {
 	// Send calls that haven't been confirmed - may not have been sent
 	// and effects should be idempotent
 	for _, call := range c.calls {
-		c.Send(NewMethod(call.ID, call.ServiceMethod, call.Args.([]interface{})))
+		IgnoreErr(c.Send(NewMethod(call.ID, call.ServiceMethod, call.Args.([]interface{}))), "resend method")
 	}
 
 	// Resend subscriptions and patch up collections
 	for _, sub := range c.subs {
-		c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{})))
+		IgnoreErr(c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{}))), "resend sub")
 	}
 }
 
-// Subscribe subscribes to data updates.
+// Subscribe to data updates.
 func (c *Client) Subscribe(subName string, done chan *Call, args ...interface{}) *Call {
 
 	if args == nil {
 		args = []interface{}{}
 	}
 	call := new(Call)
-	call.ID = c.newID()
+	call.ID = c.Next()
 	call.ServiceMethod = subName
 	call.Args = args
 	call.Owner = c
@@ -269,7 +260,7 @@ func (c *Client) Subscribe(subName string, done chan *Call, args ...interface{})
 		// RPCs that will be using that channel.  If the channel
 		// is totally unbuffered, it's best not to run at all.
 		if cap(done) == 0 {
-			log.Panic("ddp.rpc: done channel is unbuffered")
+			log.Fatal("ddp.rpc: done channel is unbuffered")
 		}
 	}
 	call.Done = done
@@ -279,7 +270,7 @@ func (c *Client) Subscribe(subName string, done chan *Call, args ...interface{})
 	subArgs := make([]interface{}, len(args))
 	copy(subArgs, args)
 
-	c.Send(NewSub(call.ID, subName, args))
+	IgnoreErr(c.Send(NewSub(call.ID, subName, args)), "send sub")
 
 	return call
 }
@@ -302,7 +293,7 @@ func (c *Client) Go(serviceMethod string, done chan *Call, args ...interface{}) 
 		args = []interface{}{}
 	}
 	call := new(Call)
-	call.ID = c.newID()
+	call.ID = c.Next()
 	call.ServiceMethod = serviceMethod
 	call.Args = args
 	call.Owner = c
@@ -314,13 +305,13 @@ func (c *Client) Go(serviceMethod string, done chan *Call, args ...interface{}) 
 		// RPCs that will be using that channel.  If the channel
 		// is totally unbuffered, it's best not to run at all.
 		if cap(done) == 0 {
-			log.Panic("ddp.rpc: done channel is unbuffered")
+			log.Fatal("ddp.rpc: done channel is unbuffered")
 		}
 	}
 	call.Done = done
 	c.calls[call.ID] = call
 
-	c.Send(NewMethod(call.ID, serviceMethod, args))
+	IgnoreErr(c.Send(NewMethod(call.ID, serviceMethod, args)), "send method")
 
 	return call
 }
@@ -332,10 +323,10 @@ func (c *Client) Call(serviceMethod string, args ...interface{}) (interface{}, e
 }
 
 // Ping sends a heartbeat signal to the server. The Ping doesn't look for
-// a response but may trigger the connection to reconnect if the ping timesout.
+// a response but may trigger the connection to reconnect if the ping times out.
 // This is primarily useful for reviving an unresponsive Client connection.
 func (c *Client) Ping() {
-	c.PingPong(c.newID(), c.HeartbeatTimeout, func(err error) {
+	c.PingPong(c.Next(), c.HeartbeatTimeout, func(err error) {
 		if err != nil {
 			// Is there anything else we should or can do?
 			c.reconnectLater()
@@ -356,9 +347,9 @@ func (c *Client) PingPong(id string, timeout time.Duration, handler func(error))
 	c.pingsOut++
 	pings, ok := c.pings[id]
 	if !ok {
-		pings = make([]*pingTracker, 0, 5)
+		pings = make([]*PingTracker, 0, 5)
 	}
-	tracker := &pingTracker{handler: handler, timeout: timeout, timer: time.AfterFunc(timeout, func() {
+	tracker := &PingTracker{handler: handler, timeout: timeout, timer: time.AfterFunc(timeout, func() {
 		handler(fmt.Errorf("ping timeout"))
 	})}
 	c.pings[id] = append(pings, tracker)
@@ -380,7 +371,7 @@ func (c *Client) Close() {
 
 	// Close websocket
 	if c.ws != nil {
-		c.ws.Close()
+		IgnoreErr(c.ws.Close(), "close ws")
 		c.ws = nil
 	}
 	for _, collection := range c.collections {
@@ -413,18 +404,7 @@ func (c *Client) Stats() *ClientStats {
 	}
 }
 
-// SocketLogActive returns the current logging status for the socket.
-func (c *Client) SocketLogActive() bool {
-	return c.writeLog.Active
-}
-
-// SetSocketLogActive to true to enable logging of raw socket data.
-func (c *Client) SetSocketLogActive(active bool) {
-	c.writeLog.Active = active
-	c.readLog.Active = active
-}
-
-// CollectionByName retrieves a collection by it's name.
+// CollectionByName retrieves a collection by its name.
 func (c *Client) CollectionByName(name string) Collection {
 	collection, ok := c.collections[name]
 	if !ok {
@@ -443,23 +423,19 @@ func (c *Client) CollectionStats() []CollectionStats {
 	return stats
 }
 
-// start starts a new client connection on the provided websocket
+// start a new client connection on the provided websocket
 func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 
 	c.status(CONNECTING)
 
 	c.ws = ws
-	c.writeLog.SetWriter(ws)
-	c.writeSocketStats = NewWriterStats(c.writeLog)
-	c.writeStats.SetWriter(c.writeSocketStats)
-	c.readLog.SetReader(ws)
-	c.readSocketStats = NewReaderStats(c.readLog)
-	c.readStats.SetReader(c.readSocketStats)
+	c.writeSocketStats = NewWriterStats(c.ws)
+	c.readSocketStats = NewReaderStats(c.ws)
 
 	// We spin off an inbox stuffing goroutine
 	go c.inboxWorker(c.readStats)
 
-	c.Send(connect)
+	IgnoreErr(c.Send(connect), "send connect")
 }
 
 // inboxManager pulls messages from the inbox and routes them to appropriate
@@ -470,16 +446,16 @@ func (c *Client) inboxManager() {
 		case msg := <-c.inbox:
 			// Message!
 			//log.Println("Got message", msg)
-			mtype, ok := msg["msg"]
+			msgType, ok := msg["msg"]
 			if ok {
-				switch mtype.(string) {
+				switch msgType.(string) {
 				// Connection management
 				case "connected":
 					c.status(CONNECTED)
 					for _, collection := range c.collections {
 						collection.init()
 					}
-					c.version = "1" // Currently the only version we support
+					c.version = "1" // "1" is the only version we support
 					c.session = msg["session"].(string)
 					// Start automatic heartbeats
 					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
@@ -498,9 +474,9 @@ func (c *Client) inboxManager() {
 					// We received a ping - need to respond with a pong
 					id, ok := msg["id"]
 					if ok {
-						c.Send(NewPong(id.(string)))
+						IgnoreErr(c.Send(NewPong(id.(string))), "send id ping")
 					} else {
-						c.Send(NewPong(""))
+						IgnoreErr(c.Send(NewPong("")), "send empty ping")
 					}
 					c.pingsIn++
 				case "pong":
@@ -523,7 +499,7 @@ func (c *Client) inboxManager() {
 
 				// Live Data
 				case "nosub":
-					log.Println("Subscription returned a nosub error", msg)
+					log.WithField("msg", msg).Debug("sub returned a nosub error")
 					// Clear related subscriptions
 					sub, ok := msg["id"]
 					if ok {
@@ -531,7 +507,7 @@ func (c *Client) inboxManager() {
 						runningSub := c.subs[id]
 
 						if runningSub != nil {
-							runningSub.Error = errors.New("Subscription returned a nosub error")
+							runningSub.Error = errors.New("sub returned a nosub error")
 							runningSub.done()
 							delete(c.subs, id)
 						}
@@ -579,7 +555,7 @@ func (c *Client) inboxManager() {
 
 				default:
 					// Ignore?
-					log.Println("Server sent unexpected message", msg)
+					log.WithField("msg", msg).Debug("Server sent unexpected message")
 				}
 			} else {
 				// Current Meteor server sends an undocumented DDP message
@@ -591,14 +567,14 @@ func (c *Client) inboxManager() {
 					case string:
 						c.serverID = ID
 					default:
-						log.Println("Server cluster node", serverID)
+						log.WithField("id", serverID).Debug("Server cluster node")
 					}
 				} else {
-					log.Println("Server sent message with no `msg` field", msg)
+					log.WithField("msg", msg).Debug("Server sent message with no `msg` field")
 				}
 			}
 		case err := <-c.errors:
-			log.Println("Websocket error", err)
+			log.WithError(err).Warn("Websocket error")
 		}
 	}
 }
@@ -632,7 +608,7 @@ func (c *Client) inboxWorker(ws io.Reader) {
 			c.pingTimer.Reset(c.HeartbeatInterval)
 		}
 		if event == nil {
-			log.Println("Inbox worker found nil event. May be due to broken websocket. Reconnecting.")
+			log.Debug("Inbox worker found nil event. May be due to broken websocket. Reconnecting.")
 			break
 		} else {
 			c.inbox <- event.(map[string]interface{})
@@ -642,7 +618,7 @@ func (c *Client) inboxWorker(ws io.Reader) {
 	c.reconnectLater()
 }
 
-// reconnectLater schedules a reconnect for later. We need to make sure that we don't
+// reconnectLater schedules a reconnect action for later. We need to make sure that we don't
 // block, and that we don't reconnect more frequently than once every c.ReconnectInterval
 func (c *Client) reconnectLater() {
 	c.Close()
