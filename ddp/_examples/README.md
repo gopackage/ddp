@@ -1,0 +1,7 @@
+# DDP Simple Demo App
+
+The simple app demonstrates the features of the DDP library. Our app assumes you have the Meteor "Simple Todos" tutorial running in development mode with the tutorial at least to [Step 9 - Publications](https://github.com/meteor/blaze-tutorial/tree/master/src/simple-todos/step09). The Meteor app should implement user logins, methods, and publications and our app exercises all these features using DDP. The code assumes there is a user with the default user credentials from the tutorial (user `meteorite` password `password`) but feel free to adjust the code to match whatever users are in your app.
+
+For the quickest start/test, follow these steps:
+
+Go to [Meteor tutorial GitHub](https://github.com/meteor/blaze-tutorial) and click on the "Code" button, select "Download Zip". Once downloaded, unzip the code file, open a command line in the base of the unzipped contents and `cd src/simple-todos/step09` then type `meteor` to run the app. If the tutorial crashes out of the box, you may have to run `meteor update` and `meteor npm install --save @babel/runtime`, then `meteor`, in order to fix the crashes. Once running, in a separate command line, clone this ddp repository and cd into the root of the repo, and run `go run ./_examples`. You will see the app logs and if you have a web page open to the Meteor server you will see the task created when the simple demo app calls the `tasks.insert` method.
