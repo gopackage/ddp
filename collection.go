@@ -98,13 +98,14 @@ func (c *KeyCache) movedBefore(msg Update) {
 // init prepares the collection for data updates (called when a new connection is
 // made or a connection/session is resumed).
 func (c *KeyCache) init() {
-	// TODO start to patch up the current data with fresh server state
+	// Reset the local collection with fresh server state
+	c.items = make(map[string]Update)
 }
 
+// reset causes the collection to return to a fresh state. Resets are currently implemented by clearing all items
+// from the collection cache.
 func (c *KeyCache) reset() {
-	// TODO we should mark the collection but maintain it's contents and then
-	// patch up the current contents with the new contents when we receive them.
-	//c.items = nil
+	c.init()
 	c.notify("reset", "", nil)
 }
 
