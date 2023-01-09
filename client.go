@@ -13,10 +13,11 @@ import (
 )
 
 const (
-	DISCONNECTED = iota
-	DIALING
-	CONNECTING
-	CONNECTED
+	DISCONNECTING 	= 0
+	DISCONNECTED 	= 1
+	CONNECTING		= 2
+	CONNECTED		= 3
+	RECONNECTING	= 4
 )
 
 type ConnectionListener interface {
@@ -122,8 +123,8 @@ func NewClient(url, origin string) *Client {
 		collections:       map[string]Collection{},
 		url:               url,
 		origin:            origin,
-		inbox:             make(chan map[string]interface{}, 100),
-		errors:            make(chan error, 100),
+		// inbox:             make(chan map[string]interface{}, 100),
+		// errors:           make(chan error, 100),
 		pings:             map[string][]*PingTracker{},
 		calls:             map[string]*Call{},
 		subs:              map[string]*Call{},
@@ -139,9 +140,6 @@ func NewClient(url, origin string) *Client {
 		KeyManager: *NewKeyManager(),
 	}
 	c.encoder = json.NewEncoder(c.writeStats)
-
-	// We spin off an inbox processing goroutine
-	go c.inboxManager()
 
 	return c
 }
@@ -179,7 +177,6 @@ func (c *Client) status(status int) {
 
 // Connect attempts to connect the client to the server.
 func (c *Client) Connect() error {
-	c.status(DIALING)
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
 		c.Close()
@@ -213,7 +210,6 @@ func (c *Client) Reconnect() {
 	c.reconnects++
 
 	// Reconnect
-	c.status(DIALING)
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
 		c.Close()
@@ -364,6 +360,10 @@ func (c *Client) Send(msg interface{}) error {
 
 // Close implements the io.Closer interface.
 func (c *Client) Close() {
+	if(c.connectionStatus != DISCONNECTED) {
+		c.status(DISCONNECTING)
+	}
+
 	// Shutdown out all outstanding pings
 	if c.pingTimer != nil {
 		c.pingTimer.Stop()
@@ -375,6 +375,17 @@ func (c *Client) Close() {
 		IgnoreErr(c.ws.Close(), "close ws")
 		c.ws = nil
 	}
+
+	//Close channels
+	if(c.inbox != nil) {
+		close(c.inbox)
+		c.inbox = nil
+	}
+	if(c.inbox != nil) {
+		close(c.errors)
+		c.errors = nil
+	}
+
 	for _, collection := range c.collections {
 		collection.reset()
 	}
@@ -429,14 +440,24 @@ func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 
 	c.status(CONNECTING)
 
+	// We spin off an error processing goroutine
+	if(c.errors == nil) {
+		c.errors = make(chan error, 100)
+		go c.errorManager()
+	}
+
+	// We spin off an inbox processing goroutine
+	if(c.inbox == nil) {
+		c.inbox = make(chan map[string]interface{}, 100)
+		go c.inboxManager()
+		go c.inboxWorker(c.readStats)
+	}
+
 	c.ws = ws
 	c.writeSocketStats = NewWriterStats(c.ws)
 	c.writeStats.Writer = c.writeSocketStats
 	c.readSocketStats = NewReaderStats(c.ws)
 	c.readStats.Reader = c.readSocketStats
-
-	// We spin off an inbox stuffing goroutine
-	go c.inboxWorker(c.readStats)
 
 	IgnoreErr(c.Send(connect), "send connect")
 }
@@ -444,142 +465,143 @@ func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 // inboxManager pulls messages from the inbox and routes them to appropriate
 // handlers.
 func (c *Client) inboxManager() {
-	for {
-		select {
-		case msg := <-c.inbox:
-			// Message!
-			//log.Println("Got message", msg)
-			msgType, ok := msg["msg"]
-			if ok {
-				log.WithField("msg", msgType).Debug("recv")
-				switch msgType.(string) {
-				// Connection management
-				case "connected":
-					c.status(CONNECTED)
-					for _, collection := range c.collections {
-						collection.init()
-					}
-					c.version = "1" // "1" is the only version we support
-					c.session = msg["session"].(string)
-					// Start automatic heartbeats
-					c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
-						c.Ping()
-						c.pingTimer.Reset(c.HeartbeatInterval)
-					})
-					// Notify connection listeners
-					for _, listener := range c.connectionListeners {
-						go listener.Connected()
-					}
-				case "failed":
-					log.Fatalf("IM Failed to connect, we support version 1 but server supports %s", msg["version"])
+	for msg := range c.inbox {
+		// Message!
+		//log.Println("Got message", msg)
+		msgType, ok := msg["msg"]
+		if ok {
+			log.WithField("msg", msgType).Debug("recv")
+			switch msgType.(string) {
+			// Connection management
+			case "connected":
+				c.status(CONNECTED)
+				for _, collection := range c.collections {
+					collection.init()
+				}
+				c.version = "1" // "1" is the only version we support
+				c.session = msg["session"].(string)
+				// Start automatic heartbeats
+				c.pingTimer = time.AfterFunc(c.HeartbeatInterval, func() {
+					c.Ping()
+					c.pingTimer.Reset(c.HeartbeatInterval)
+				})
+				// Notify connection listeners
+				for _, listener := range c.connectionListeners {
+					go listener.Connected()
+				}
+			case "failed":
+				log.Fatalf("IM Failed to connect, we support version 1 but server supports %s", msg["version"])
 
-				// Heartbeats
-				case "ping":
-					// We received a ping - need to respond with a pong
-					id, ok := msg["id"]
-					if ok {
-						IgnoreErr(c.Send(NewPong(id.(string))), "send id ping")
-					} else {
-						IgnoreErr(c.Send(NewPong("")), "send empty ping")
+			// Heartbeats
+			case "ping":
+				// We received a ping - need to respond with a pong
+				id, ok := msg["id"]
+				if ok {
+					IgnoreErr(c.Send(NewPong(id.(string))), "send id ping")
+				} else {
+					IgnoreErr(c.Send(NewPong("")), "send empty ping")
+				}
+				c.pingsIn++
+			case "pong":
+				// We received a pong - we can clear the ping tracker and call its handler
+				id, ok := msg["id"]
+				var key string
+				if ok {
+					key = id.(string)
+				}
+				pings, ok := c.pings[key]
+				if ok && len(pings) > 0 {
+					ping := pings[0]
+					pings = pings[1:]
+					if len(key) == 0 || len(pings) > 0 {
+						c.pings[key] = pings
 					}
-					c.pingsIn++
-				case "pong":
-					// We received a pong - we can clear the ping tracker and call its handler
-					id, ok := msg["id"]
-					var key string
-					if ok {
-						key = id.(string)
-					}
-					pings, ok := c.pings[key]
-					if ok && len(pings) > 0 {
-						ping := pings[0]
-						pings = pings[1:]
-						if len(key) == 0 || len(pings) > 0 {
-							c.pings[key] = pings
-						}
-						ping.timer.Stop()
-						ping.handler(nil)
-					}
+					ping.timer.Stop()
+					ping.handler(nil)
+				}
 
-				// Live Data
-				case "nosub":
-					log.WithField("msg", msg).Debug("sub returned a nosub error")
-					// Clear related subscriptions
-					sub, ok := msg["id"]
-					if ok {
-						id := sub.(string)
-						runningSub := c.subs[id]
+			// Live Data
+			case "nosub":
+				log.WithField("msg", msg).Debug("sub returned a nosub error")
+				// Clear related subscriptions
+				sub, ok := msg["id"]
+				if ok {
+					id := sub.(string)
+					runningSub := c.subs[id]
 
-						if runningSub != nil {
-							runningSub.Error = errors.New("sub returned a nosub error")
-							runningSub.done()
-							delete(c.subs, id)
-						}
+					if runningSub != nil {
+						runningSub.Error = errors.New("sub returned a nosub error")
+						runningSub.done()
+						delete(c.subs, id)
 					}
-				case "ready":
-					// Run 'done' callbacks on all ready subscriptions
-					subs, ok := msg["subs"]
-					if ok {
-						for _, sub := range subs.([]interface{}) {
-							call, ok := c.subs[sub.(string)]
-							if ok {
-								call.done()
-							}
-						}
-					}
-				case "added":
-					c.collectionBy(msg).added(msg)
-				case "changed":
-					c.collectionBy(msg).changed(msg)
-				case "removed":
-					c.collectionBy(msg).removed(msg)
-				case "addedBefore":
-					c.collectionBy(msg).addedBefore(msg)
-				case "movedBefore":
-					c.collectionBy(msg).movedBefore(msg)
-
-				// RPC
-				case "result":
-					id, ok := msg["id"]
-					if ok {
-						call := c.calls[id.(string)]
-						delete(c.calls, id.(string))
-						e, ok := msg["error"]
+				}
+			case "ready":
+				// Run 'done' callbacks on all ready subscriptions
+				subs, ok := msg["subs"]
+				if ok {
+					for _, sub := range subs.([]interface{}) {
+						call, ok := c.subs[sub.(string)]
 						if ok {
-							txt, _ := json.Marshal(e)
-							call.Error = fmt.Errorf(string(txt))
-							call.Reply = e
-						} else {
-							call.Reply = msg["result"]
+							call.done()
 						}
-						call.done()
 					}
-				case "updated":
-					// We currently don't do anything with updated status
+				}
+			case "added":
+				c.collectionBy(msg).added(msg)
+			case "changed":
+				c.collectionBy(msg).changed(msg)
+			case "removed":
+				c.collectionBy(msg).removed(msg)
+			case "addedBefore":
+				c.collectionBy(msg).addedBefore(msg)
+			case "movedBefore":
+				c.collectionBy(msg).movedBefore(msg)
 
+			// RPC
+			case "result":
+				id, ok := msg["id"]
+				if ok {
+					call := c.calls[id.(string)]
+					delete(c.calls, id.(string))
+					e, ok := msg["error"]
+					if ok {
+						txt, _ := json.Marshal(e)
+						call.Error = fmt.Errorf(string(txt))
+						call.Reply = e
+					} else {
+						call.Reply = msg["result"]
+					}
+					call.done()
+				}
+			case "updated":
+				// We currently don't do anything with updated status
+
+			default:
+				// Ignore?
+				log.WithField("msg", msg).Debug("Server sent unexpected message")
+			}
+		} else {
+			// Current Meteor server sends an undocumented DDP message
+			// (looks like clustering "hint"). We will register and
+			// ignore rather than log an error.
+			serverID, ok := msg["server_id"]
+			if ok {
+				switch ID := serverID.(type) {
+				case string:
+					c.serverID = ID
 				default:
-					// Ignore?
-					log.WithField("msg", msg).Debug("Server sent unexpected message")
+					log.WithField("id", serverID).Debug("Server cluster node")
 				}
 			} else {
-				// Current Meteor server sends an undocumented DDP message
-				// (looks like clustering "hint"). We will register and
-				// ignore rather than log an error.
-				serverID, ok := msg["server_id"]
-				if ok {
-					switch ID := serverID.(type) {
-					case string:
-						c.serverID = ID
-					default:
-						log.WithField("id", serverID).Debug("Server cluster node")
-					}
-				} else {
-					log.WithField("msg", msg).Debug("Server sent message with no `msg` field")
-				}
+				log.WithField("msg", msg).Debug("Server sent message with no `msg` field")
 			}
-		case err := <-c.errors:
-			log.WithError(err).Warn("Websocket error")
 		}
+	}
+}
+
+func (c *Client) errorManager() {
+	for err := range c.errors {
+		log.WithError(err).Warn("Websocket error")
 	}
 }
 
@@ -603,10 +625,19 @@ func (c *Client) inboxWorker(ws io.Reader) {
 	for {
 		var event interface{}
 
-		if err := dec.Decode(&event); err == io.EOF {
+		err := dec.Decode(&event)
+
+		// stop worker if disconnected
+		if(c.connectionStatus == DISCONNECTED || c.connectionStatus == DISCONNECTING || c.connectionStatus == RECONNECTING) {
+			return
+		}
+
+		if(err == io.EOF) {
 			break
 		} else if err != nil {
-			c.errors <- err
+			if(c.errors != nil) {
+				c.errors <- err
+			}
 		}
 		if c.pingTimer != nil {
 			c.pingTimer.Reset(c.HeartbeatInterval)
@@ -615,16 +646,19 @@ func (c *Client) inboxWorker(ws io.Reader) {
 			log.Debug("Inbox worker found nil event. May be due to broken websocket. Reconnecting.")
 			break
 		} else {
-			c.inbox <- event.(map[string]interface{})
+			if(c.inbox != nil) {
+				c.inbox <- event.(map[string]interface{})
+			}
 		}
 	}
-
+	
 	c.reconnectLater()
 }
 
 // reconnectLater schedules a reconnect action for later. We need to make sure that we don't
 // block, and that we don't reconnect more frequently than once every c.ReconnectInterval
 func (c *Client) reconnectLater() {
+	c.status(RECONNECTING)
 	c.Close()
 	c.reconnectLock.Lock()
 	defer c.reconnectLock.Unlock()
