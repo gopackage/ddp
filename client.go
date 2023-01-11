@@ -13,11 +13,11 @@ import (
 )
 
 const (
-	DISCONNECTING 	= 0
-	DISCONNECTED 	= 1
-	CONNECTING		= 2
-	CONNECTED		= 3
-	RECONNECTING	= 4
+	DISCONNECTED 	= iota
+	DISCONNECTING
+	CONNECTED
+	CONNECTING
+	RECONNECTING
 )
 
 type ConnectionListener interface {
