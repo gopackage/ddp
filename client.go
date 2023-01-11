@@ -123,8 +123,6 @@ func NewClient(url, origin string) *Client {
 		collections:       map[string]Collection{},
 		url:               url,
 		origin:            origin,
-		// inbox:             make(chan map[string]interface{}, 100),
-		// errors:           make(chan error, 100),
 		pings:             map[string][]*PingTracker{},
 		calls:             map[string]*Call{},
 		subs:              map[string]*Call{},
