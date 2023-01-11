@@ -175,6 +175,7 @@ func (c *Client) status(status int) {
 
 // Connect attempts to connect the client to the server.
 func (c *Client) Connect() error {
+	c.status(CONNECTING)
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
 		c.Close()
