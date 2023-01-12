@@ -16,7 +16,7 @@ const (
 	DISCONNECTED 	= iota
 	DISCONNECTING
 	CONNECTED
-	DALLING
+	DIALING
 	CONNECTING
 	RECONNECTING
 )
@@ -176,7 +176,7 @@ func (c *Client) status(status int) {
 
 // Connect attempts to connect the client to the server.
 func (c *Client) Connect() error {
-	c.status(DALLING)
+	c.status(DIALING)
 	ws, err := websocket.Dial(c.url, "", c.origin)
 	if err != nil {
 		c.Close()
