@@ -114,7 +114,7 @@ func (c *KeyCache) notify(operation, id string, doc Update) {
 	c.mux.RLock()
 	defer c.mux.RUnlock()
 	for _, listener := range c.listeners {
-		listener.CollectionUpdate(c.Name, operation, id, doc)
+		go listener.CollectionUpdate(c.Name, operation, id, doc)
 	}
 }
 
