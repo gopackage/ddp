@@ -239,12 +239,12 @@ func (c *Client) Reconnect() {
 	// Send calls that haven't been confirmed - may not have been sent
 	// and effects should be idempotent
 	for _, call := range c.calls {
-		IgnoreErr(c.Send(NewMethod(call.ID, call.ServiceMethod, call.Args.([]interface{}))), "resend method")
+		IgnoreErr(c.Send(NewMethod(call.ID, call.ServiceMethod, call.Args.([]interface{}))), "resend method", c.l)
 	}
 
 	// Resend subscriptions and patch up collections
 	for _, sub := range c.subs {
-		IgnoreErr(c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{}))), "resend sub")
+		IgnoreErr(c.Send(NewSub(sub.ID, sub.ServiceMethod, sub.Args.([]interface{}))), "resend sub", c.l)
 	}
 }
 
@@ -259,6 +259,7 @@ func (c *Client) Subscribe(subName string, done chan *Call, args ...interface{})
 	call.ServiceMethod = subName
 	call.Args = args
 	call.Owner = c
+	call.l = c.l
 
 	if done == nil {
 		done = make(chan *Call, 10) // buffered.
@@ -278,7 +279,7 @@ func (c *Client) Subscribe(subName string, done chan *Call, args ...interface{})
 	subArgs := make([]interface{}, len(args))
 	copy(subArgs, args)
 
-	IgnoreErr(c.Send(NewSub(call.ID, subName, args)), "send sub")
+	IgnoreErr(c.Send(NewSub(call.ID, subName, args)), "send sub", c.l)
 
 	return call
 }
@@ -305,6 +306,7 @@ func (c *Client) Go(serviceMethod string, done chan *Call, args ...interface{}) 
 	call.ServiceMethod = serviceMethod
 	call.Args = args
 	call.Owner = c
+	call.l = c.l
 	if done == nil {
 		done = make(chan *Call, 10) // buffered.
 	} else {
@@ -319,7 +321,7 @@ func (c *Client) Go(serviceMethod string, done chan *Call, args ...interface{}) 
 	call.Done = done
 	c.calls[call.ID] = call
 
-	IgnoreErr(c.Send(NewMethod(call.ID, serviceMethod, args)), "send method")
+	IgnoreErr(c.Send(NewMethod(call.ID, serviceMethod, args)), "send method", c.l)
 
 	return call
 }
@@ -383,7 +385,7 @@ func (c *Client) Close() {
 
 	// Close websocket
 	if c.ws != nil {
-		IgnoreErr(c.ws.Close(), "close ws")
+		IgnoreErr(c.ws.Close(), "close ws", c.l)
 		c.ws = nil
 	}
 
@@ -470,7 +472,7 @@ func (c *Client) start(ws *websocket.Conn, connect *Connect) {
 	c.readSocketStats = NewReaderStats(c.ws)
 	c.readStats.Reader = c.readSocketStats
 
-	IgnoreErr(c.Send(connect), "send connect")
+	IgnoreErr(c.Send(connect), "send connect", c.l)
 }
 
 // inboxManager pulls messages from the inbox and routes them to appropriate
@@ -507,9 +509,9 @@ func (c *Client) inboxManager() {
 				// We received a ping - need to respond with a pong
 				id, ok := msg["id"]
 				if ok {
-					IgnoreErr(c.Send(NewPong(id.(string))), "send id ping")
+					IgnoreErr(c.Send(NewPong(id.(string))), "send id ping", c.l)
 				} else {
-					IgnoreErr(c.Send(NewPong("")), "send empty ping")
+					IgnoreErr(c.Send(NewPong("")), "send empty ping", c.l)
 				}
 				c.pingsIn++
 			case "pong":

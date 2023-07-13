@@ -54,6 +54,8 @@ type Call struct {
 	Error         error       // After completion, the error status.
 	Done          chan *Call  // Strobes when call is complete.
 	Owner         *Client     // Client that owns the method call
+
+	l *log.Entry // logger to use for all logs
 }
 
 // done removes the call from any owners and strobes the done channel with itself.
@@ -65,13 +67,13 @@ func (call *Call) done() {
 	default:
 		// We don't want to block here.  It is the caller's responsibility to make
 		// sure the channel has enough buffer space. See comment in Go().
-		log.Debug("rpc: discarding Call reply due to insufficient Done chan capacity")
+		call.l.Debug("rpc: discarding Call reply due to insufficient Done chan capacity")
 	}
 }
 
 // IgnoreErr logs an error if it occurs and ignores it.
-func IgnoreErr(err error, msg string) {
+func IgnoreErr(err error, msg string, l *log.Entry) {
 	if err != nil {
-		log.WithError(err).Debug(msg)
+		l.WithError(err).Debug(msg)
 	}
 }
